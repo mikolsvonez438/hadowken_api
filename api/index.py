@@ -41,7 +41,7 @@ limiter = Limiter(
 
 # Production-ready Talisman
 Talisman(app, 
-    force_https=True,
+    force_https=False,
     strict_transport_security=True,
     content_security_policy={
         'default-src': "'self'",
@@ -544,11 +544,17 @@ def log_token_generation(account_id, user_id, ip_address, token=None):
 
 @app.route('/')
 def serve_index():
-    return send_from_directory('.', 'index.html')
-
-@app.route('/<path:path>')
-def serve_static(path):
-    return send_from_directory('.', path)
+    return jsonify({
+        "status": "ok",
+        "message": "Netflix Cookie Checker API is running",
+        "endpoints": {
+            "test": "/api/test",
+            "signup": "/api/auth/signup",
+            "login": "/api/auth/login",
+            "check": "/api/check",
+            "accounts": "/api/accounts"
+        }
+    })
 
 @app.route('/api/auth/signup', methods=['POST', 'OPTIONS'])
 @cross_origin(supports_credentials=True)
@@ -586,7 +592,7 @@ def signup():
 
 @app.route('/api/test', methods=['GET', 'OPTIONS'])
 def test():
-    return 'GAGOOOOOOOOOO'
+    return jsonify({"status": "ok", "message": "API is working!"})
 
 @app.route('/api/auth/login', methods=['POST', 'OPTIONS'])
 @cross_origin(supports_credentials=True)

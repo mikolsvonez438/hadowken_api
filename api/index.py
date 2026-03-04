@@ -584,6 +584,10 @@ def signup():
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
 
+@app.route('/api/test', methods=['GET', 'OPTIONS'])
+def test():
+    return 'GAGOOOOOOOOOO'
+
 @app.route('/api/auth/login', methods=['POST', 'OPTIONS'])
 @cross_origin(supports_credentials=True)
 @limiter.limit("5 per minute")

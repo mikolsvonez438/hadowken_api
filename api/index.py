@@ -24,8 +24,6 @@ from flask_limiter.util import get_remote_address
 from flask_talisman import Talisman
 import secrets
 from marshmallow import Schema, fields, validate, ValidationError
-from werkzeug.wrappers import Request as WerkzeugRequest
-from io import BytesIO
 
 load_dotenv()
 urllib3.disable_warnings(InsecureRequestWarning)
@@ -1083,15 +1081,5 @@ def generate_account_token(user, account_id):
         
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
-
-# VERCEL SERVERLESS HANDLER
-def handler(request, context):
-    environ = request.environ
-    environ['wsgi.input'] = BytesIO(request.get_data())
-    
-    response = app(environ, lambda status, headers: None)
-    return {
-        'statusCode': response.status_code,
-        'headers': dict(response.headers),
-        'body': response.get_data().decode('utf-8')
-    }
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)

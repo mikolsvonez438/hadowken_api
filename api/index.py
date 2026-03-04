@@ -1092,3 +1092,13 @@ def generate_account_token(user, account_id):
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
 
+@app.route('/api/health', methods=['GET'])
+def health():
+    return jsonify({
+        "status": "ok",
+        "env_vars_set": {
+            "SUPABASE_URL": bool(os.environ.get('SUPABASE_URL')),
+            "SUPABASE_SERVICE_KEY": bool(os.environ.get('SUPABASE_SERVICE_KEY')),
+            "FLASK_SECRET_KEY": bool(os.environ.get('FLASK_SECRET_KEY'))
+        }
+    })

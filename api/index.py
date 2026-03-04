@@ -32,12 +32,7 @@ app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 
 # Vercel-compatible limiter (memory storage acceptable for serverless)
-limiter = Limiter(
-    app=app,
-    key_func=get_remote_address,
-    default_limits=["200 per day", "50 per hour"],
-    storage_uri="memory://"
-)
+limiter = Limiter(app=app, key_func=get_remote_address, default_limits=[])
 
 # Production-ready Talisman
 Talisman(app, 
@@ -596,7 +591,6 @@ def test():
 
 @app.route('/api/auth/login', methods=['POST', 'OPTIONS'])
 @cross_origin(supports_credentials=True)
-@limiter.limit("5 per minute")
 def login():
     if request.method == 'OPTIONS':
         response = make_response()
@@ -676,7 +670,6 @@ def get_current_user(user):
 @app.route('/api/check', methods=['POST', 'OPTIONS'])
 @cross_origin(supports_credentials=True)
 @require_auth
-@limiter.limit("10 per minute")
 def check_cookie(user):
     if request.method == 'OPTIONS':
         return '', 204

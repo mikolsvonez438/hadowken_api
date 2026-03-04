@@ -16,7 +16,7 @@ import uuid
 import hashlib
 from datetime import datetime
 from supabase import create_client, Client
-from supabase_auth.errors import AuthApiError
+from gotrue.errors import AuthApiError
 from dotenv import load_dotenv
 from deep_translator import GoogleTranslator
 from flask_limiter import Limiter

@@ -1122,3 +1122,30 @@ def health():
             "FLASK_SECRET_KEY": bool(os.environ.get('FLASK_SECRET_KEY'))
         }
     })
+    
+@app.route('/api/auth/key', methods=['GET', 'OPTIONS'])
+@cross_origin(supports_credentials=True)
+@require_auth
+def get_encryption_key(user):
+    """Deliver encryption key to authenticated clients"""
+    if request.method == 'OPTIONS':
+        response = make_response()
+        response.headers.add('Access-Control-Max-Age', '86400')
+        return response, 204
+    
+    try:
+        # Return the public-facing encryption key
+        # In production, you might want to rotate this or use user-specific keys
+        key = os.environ.get('API_ENCRYPTION_KEY')
+        if not key:
+            # Generate and return a session-specific key
+            key = base64.urlsafe_b64encode(AESGCM.generate_key(bit_length=256)).decode()
+            
+        return jsonify({
+            'status': 'success',
+            'key': key,
+            'algorithm': 'AES-256-GCM',
+            'salt': crypto.salt
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500

@@ -107,13 +107,15 @@ class PureEncryption:
 # Create global instance
 crypto = PureEncryption()
 
-# Standalone function exports - THESE WERE MISSING!
+print(">>> Creating crypto instance...")  # Debug line
+crypto = PureEncryption()
+
 def encrypt_api_response(data: dict, sensitive_fields: list = None) -> dict:
-    """Encrypt API response data using the global crypto instance"""
+    print(f">>> encrypt_api_response called with {type(data)}")  # Debug line
     return crypto.encrypt_response_data(data, sensitive_fields)
 
 def create_encrypted_wrapper(data: dict, status: str = "success", message: str = None) -> dict:
-    """Create a standard encrypted response wrapper"""
+    print(f">>> create_encrypted_wrapper called")  # Debug line
     return {
         "status": status,
         "encrypted": True,
@@ -121,3 +123,5 @@ def create_encrypted_wrapper(data: dict, status: str = "success", message: str =
         "data": crypto.encrypt_response_data(data) if data else {},
         "message": message
     }
+
+print(">>> crypto_utils.py loaded successfully!")  # Debug line

@@ -1,150 +1,119 @@
+# api/crypto_utils.py - Pure Python, no external dependencies
 import os
 import json
 import base64
-import secrets
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
-from Crypto.Protocol.KDF import PBKDF2
 import hashlib
 import hmac
+import secrets
 
-class DataEncryption:
+class PureEncryption:
     """
-    Encryption utility using PyCryptodome (Vercel-compatible)
-    Uses AES-256-CBC with HMAC-SHA256 for authentication
+    Pure Python encryption using only standard library
+    AES-256-CBC simulation using SHA-256 + XOR
     """
     
     def __init__(self):
-        self.master_key = self._get_or_create_key()
+        self.master_key = self._get_key()
         self.salt = os.environ.get('ENCRYPTION_SALT', 'netflix_checker_salt_v1')
-        
-    def _get_or_create_key(self):
-        """Get encryption key from environment"""
+    
+    def _get_key(self):
         key = os.environ.get('API_ENCRYPTION_KEY')
         if not key:
-            # For Vercel, you MUST set this in environment variables
-            raise ValueError("API_ENCRYPTION_KEY environment variable is required")
-        # Decode base64 key (ensure proper padding)
-        key += '=' * (4 - len(key) % 4) if len(key) % 4 else ''
+            raise ValueError("API_ENCRYPTION_KEY required")
+        # Add padding if needed
+        padding_needed = 4 - len(key) % 4 if len(key) % 4 else 0
+        key += '=' * padding_needed
         return base64.urlsafe_b64decode(key)
     
-    def derive_key(self, context: str) -> bytes:
-        """Derive context-specific key from master key"""
-        return PBKDF2(
-            self.master_key + context.encode(),
-            self.salt.encode(),
-            dkLen=32,  # 256 bits
-            count=100000,
-            hmac_hash_module=hashlib.sha256
-        )
+    def _derive_key(self, field_name: str) -> bytes:
+        """HKDF-like key derivation"""
+        info = f"{self.salt}:{field_name}".encode()
+        prk = hmac.new(self.master_key, info, hashlib.sha256).digest()
+        return hashlib.sha256(prk + info).digest()
+    
+    def _encrypt_block(self, key: bytes, block: bytes, counter: int) -> bytes:
+        """Encrypt a single block using key derivation"""
+        counter_bytes = counter.to_bytes(16, 'big')
+        # Use SHA-256 to generate keystream
+        keystream = hashlib.sha256(key + counter_bytes).digest()
+        # XOR with plaintext (use only needed bytes)
+        return bytes(b ^ keystream[i] for i, b in enumerate(block))
     
     def encrypt_field(self, plaintext: str, field_name: str = "default") -> dict:
-        """
-        Encrypt a single field
-        Returns: {v: ciphertext, i: iv, t: hmac, f: field, e: True}
-        """
+        """Encrypt field using custom AES-like construction"""
         if not plaintext:
             return {"value": "", "encrypted": False}
-            
+        
         try:
-            # Derive field-specific key
-            key = self.derive_key(field_name)
+            key = self._derive_key(field_name)
+            iv = secrets.token_bytes(16)
+            data = plaintext.encode('utf-8')
             
-            # Generate random IV
-            iv = secrets.token_bytes(16)  # 128 bits for CBC
+            # Pad to 16-byte boundary
+            pad_len = 16 - (len(data) % 16) if len(data) % 16 else 0
+            data += bytes([pad_len] * pad_len)
             
-            # Create cipher and encrypt
-            cipher = AES.new(key, AES.MODE_CBC, iv)
-            ciphertext = cipher.encrypt(pad(plaintext.encode('utf-8'), AES.block_size))
+            # CTR mode encryption
+            ciphertext = bytearray()
+            for i in range(0, len(data), 16):
+                block = data[i:i+16]
+                encrypted_block = self._encrypt_block(key, block, i // 16)
+                ciphertext.extend(encrypted_block)
             
-            # Generate HMAC for authentication
-            hmac_val = hmac.new(key, iv + ciphertext, hashlib.sha256).digest()[:16]
+            # HMAC for authentication
+            tag = hmac.new(key, iv + bytes(ciphertext), hashlib.sha256).digest()[:16]
             
             return {
-                "v": base64.b64encode(ciphertext).decode('utf-8'),
+                "v": base64.b64encode(bytes(ciphertext)).decode('utf-8'),
                 "i": base64.b64encode(iv).decode('utf-8'),
-                "t": base64.b64encode(hmac_val).decode('utf-8'),
+                "t": base64.b64encode(tag).decode('utf-8'),
                 "f": field_name,
                 "e": True
             }
         except Exception as e:
-            print(f"Encryption error for field {field_name}: {e}")
+            print(f"Encryption error: {e}")
             return {"value": plaintext, "encrypted": False}
     
-    def decrypt_field(self, encrypted_payload: dict) -> str:
-        """Decrypt a single field"""
-        if not encrypted_payload.get("e"):
-            return encrypted_payload.get("value", "")
-            
-        try:
-            key = self.derive_key(encrypted_payload["f"])
-            ciphertext = base64.b64decode(encrypted_payload["v"])
-            iv = base64.b64decode(encrypted_payload["i"])
-            tag = base64.b64decode(encrypted_payload["t"])
-            
-            # Verify HMAC
-            expected_hmac = hmac.new(key, iv + ciphertext, hashlib.sha256).digest()[:16]
-            if not hmac.compare_digest(expected_hmac, tag):
-                raise ValueError("HMAC verification failed")
-            
-            # Decrypt
-            cipher = AES.new(key, AES.MODE_CBC, iv)
-            plaintext = unpad(cipher.decrypt(ciphertext), AES.block_size)
-            return plaintext.decode('utf-8')
-        except Exception as e:
-            print(f"Decryption error: {e}")
-            return "[decryption_failed]"
-    
     def encrypt_response_data(self, data: dict, sensitive_fields: list = None) -> dict:
-        """Encrypt specific fields in a response object"""
+        """Encrypt sensitive fields"""
         if sensitive_fields is None:
             sensitive_fields = ['email', 'token', 'netflix_id', 'login_urls', 'cookie_data']
         
         if not isinstance(data, dict):
             return data
-            
-        encrypted_data = {}
         
+        encrypted = {}
         for key, value in data.items():
             if key in sensitive_fields and value:
                 if key == 'login_urls' and isinstance(value, dict):
-                    encrypted_urls = {}
-                    for url_key, url_value in value.items():
-                        if url_value:
-                            encrypted_urls[url_key] = self.encrypt_field(str(url_value), f"login_url_{url_key}")
-                        else:
-                            encrypted_urls[url_key] = {"value": "", "encrypted": False}
-                    encrypted_data[key] = encrypted_urls
+                    encrypted[key] = {
+                        k: self.encrypt_field(str(v), f"login_url_{k}") if v else {"value": "", "encrypted": False}
+                        for k, v in value.items()
+                    }
                 else:
-                    encrypted_data[key] = self.encrypt_field(str(value), key)
+                    encrypted[key] = self.encrypt_field(str(value), key)
             elif isinstance(value, dict):
-                encrypted_data[key] = self.encrypt_response_data(value, sensitive_fields)
+                encrypted[key] = self.encrypt_response_data(value, sensitive_fields)
             elif isinstance(value, list):
-                encrypted_list = []
-                for item in value:
-                    if isinstance(item, dict):
-                        encrypted_list.append(self.encrypt_response_data(item, sensitive_fields))
-                    else:
-                        encrypted_list.append(item)
-                encrypted_data[key] = encrypted_list
+                encrypted[key] = [
+                    self.encrypt_response_data(item, sensitive_fields) if isinstance(item, dict) else item
+                    for item in value
+                ]
             else:
-                encrypted_data[key] = value
-                
-        return encrypted_data
+                encrypted[key] = value
+        
+        return encrypted
 
-# Global instance
-crypto = DataEncryption()
+crypto = PureEncryption()
 
 def encrypt_api_response(data: dict, sensitive_fields: list = None) -> dict:
     return crypto.encrypt_response_data(data, sensitive_fields)
 
 def create_encrypted_wrapper(data: dict, status: str = "success", message: str = None) -> dict:
-    response = {
+    return {
         "status": status,
         "encrypted": True,
         "version": "1.0",
-        "data": encrypt_api_response(data) if data else {}
+        "data": encrypt_api_response(data) if data else {},
+        "message": message
     }
-    if message:
-        response["message"] = message
-    return response

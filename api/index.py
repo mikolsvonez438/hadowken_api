@@ -14,7 +14,6 @@ import tempfile
 import shutil
 import uuid
 import hashlib
-import base64  # Add this
 from datetime import datetime
 from supabase import create_client, Client
 from gotrue.errors import AuthApiError
@@ -25,6 +24,9 @@ from flask_limiter.util import get_remote_address
 from flask_talisman import Talisman
 import secrets
 from marshmallow import Schema, fields, validate, ValidationError
+import threading
+import time
+from collections import defaultdict
 
 
 load_dotenv()
@@ -33,44 +35,13 @@ urllib3.disable_warnings(InsecureRequestWarning)
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 
-# ============================================
-# CORS - MUST BE BEFORE OTHER MIDDLEWARE
-# ============================================
-
-# Allow your frontend domain
-ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://localhost:5000",
-    "http://localhost:8080",
-    "https://hakdowken.vercel.app",  # Your frontend - NO TRAILING SPACE!
-]
-
-# Simple CORS setup first
-CORS(app, 
-    resources={
-        r"/api/*": {
-            "origins": ALLOWED_ORIGINS,
-            "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-            "allow_headers": ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin", "X-API-Key"],
-            "expose_headers": ["Content-Type", "X-Request-Id"],
-            "supports_credentials": True,
-            "max_age": 86400
-        }
-    },
-    supports_credentials=True
-)
-
-# ============================================
-# Security (after CORS)
-# ============================================
-
+# Vercel-compatible limiter (memory storage acceptable for serverless)
 limiter = Limiter(app=app, key_func=get_remote_address, default_limits=[])
 
-# Disable Talisman for API routes or configure properly
-# Talisman can interfere with CORS if not configured right
+# Production-ready Talisman
 Talisman(app, 
-    force_https=False,  # Vercel handles HTTPS
-    strict_transport_security=False,  # Disable HSTS for now
+    force_https=False,
+    strict_transport_security=True,
     content_security_policy={
         'default-src': "'self'",
         'script-src': "'self'",
@@ -78,13 +49,31 @@ Talisman(app,
     }
 )
 
-init_encryption_middleware(app)
+# Fixed CORS - removed wildcard with credentials
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:5000",
+    "http://localhost:8080",
+    "https://hakdowken.vercel.app",
+]
+
+CORS(app, resources={
+    r"/api/*": {
+        "origins": ALLOWED_ORIGINS,
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"],
+        "supports_credentials": True,
+        "max_age": 86400
+    }
+})
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Vercel temp directory
 TEMP_DIR = "/tmp"
 
+# Supabase configuration
 SUPABASE_URL = os.environ.get('SUPABASE_URL', 'your-supabase-url')
 SUPABASE_SERVICE_KEY = os.environ.get('SUPABASE_SERVICE_KEY', 'your-service-role-key')
 SUPABASE_ANON_KEY = os.environ.get('SUPABASE_ANON_KEY', 'your-anon-key')
@@ -605,8 +594,8 @@ def test():
     return jsonify({"status": "ok", "message": "API is working!"})
 
 @app.route('/api/auth/login', methods=['POST', 'OPTIONS'])
+@cross_origin(supports_credentials=True)
 def login():
-    # Handle OPTIONS
     if request.method == 'OPTIONS':
         response = make_response()
         response.headers.add('Access-Control-Max-Age', '86400')
@@ -618,7 +607,7 @@ def login():
         password = data.get('password')
         
         if not email or not password:
-            return jsonify({'status': 'error', 'message': 'Email and password required'}), 400
+            return jsonify({'status': 'error', 'message': 'Email and password required'})
         
         auth_response = supabase.auth.sign_in_with_password({
             "email": email,
@@ -627,8 +616,7 @@ def login():
         
         profile = supabase.table('user_profiles').select('*').eq('id', auth_response.user.id).single().execute()
         
-        # Prepare response data
-        response_data = {
+        return jsonify({
             'status': 'success',
             'session': {
                 'access_token': auth_response.session.access_token,
@@ -640,24 +628,11 @@ def login():
                 'email': auth_response.user.email,
                 'is_premium': profile.data.get('is_premium', False) if profile.data else False
             }
-        }
-        
-        # Encrypt sensitive fields
-        sensitive_fields = ['access_token', 'refresh_token', 'email', 'id']
-        encrypted_data = {
-            'status': 'success',
-            'encrypted': True,
-            'version': '1.0',
-            'data': crypto.encrypt_response_data(response_data, sensitive_fields)
-        }
-        
-        return jsonify(encrypted_data)
-        
+        })
     except AuthApiError as e:
-        return jsonify({'status': 'error', 'message': 'Invalid credentials'}), 401
+        return jsonify({'status': 'error', 'message': 'Invalid credentials'})
     except Exception as e:
-        logger.error(f"Login error: {e}")
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        return jsonify({'status': 'error', 'message': str(e)})
 
 @app.route('/api/auth/logout', methods=['POST', 'OPTIONS'])
 @cross_origin(supports_credentials=True)
@@ -758,28 +733,19 @@ def check_cookie(user):
                     token=None
                 )
                 logger.info(f"Logged check for account {account_db_id}")
-            response_data = {
-                "email": account_info["email"],
-                "country": account_info["country"],
-                "plan": account_info["plan"],
-                "is_premium": account_info["premium"],
-                "subscription_type": account_info["subscription_type"],
-                "mode": "check_only",
-                "stored_in_db": account_info["ok"] and account_info["premium"]
-            }
-            return jsonify(create_encrypted_wrapper(response_data, status="success"))
-            # return jsonify({
-            #     "status": "success",
-            #     "data": {
-            #         "email": account_info["email"],
-            #         "country": account_info["country"],
-            #         "plan": account_info["plan"],
-            #         "is_premium": account_info["premium"],
-            #         "subscription_type": account_info["subscription_type"],
-            #         "mode": "check_only",
-            #         "stored_in_db": account_info["ok"] and account_info["premium"]
-            #     }
-            # })
+            
+            return jsonify({
+                "status": "success",
+                "data": {
+                    "email": account_info["email"],
+                    "country": account_info["country"],
+                    "plan": account_info["plan"],
+                    "is_premium": account_info["premium"],
+                    "subscription_type": account_info["subscription_type"],
+                    "mode": "check_only",
+                    "stored_in_db": account_info["ok"] and account_info["premium"]
+                }
+            })
         
         token_result = generate_token(netflix_id)
         
@@ -797,33 +763,21 @@ def check_cookie(user):
                 token=token_result["token"]
             )
             logger.info(f"Logged token generation for account {account_db_id}")
-            
-        response_data = {
-            "email": account_info["email"],
-            "country": account_info["country"],
-            "plan": account_info["plan"],
-            "is_premium": account_info["premium"],
-            "subscription_type": account_info["subscription_type"],
-            "token": token_result["token"],
-            "expires": token_result["expires"],
-            "login_urls": token_result["login_urls"],
-            "mode": "generate_token"
-        }
-        return jsonify(create_encrypted_wrapper(response_data, status="success"))
-        # return jsonify({
-        #     "status": "success",
-        #     "data": {
-        #         "email": account_info["email"],
-        #         "country": account_info["country"],
-        #         "plan": account_info["plan"],
-        #         "is_premium": account_info["premium"],
-        #         "subscription_type": account_info["subscription_type"],
-        #         "token": token_result["token"],
-        #         "expires": token_result["expires"],
-        #         "login_urls": token_result["login_urls"],
-        #         "mode": "generate_token"
-        #     }
-        # })
+        
+        return jsonify({
+            "status": "success",
+            "data": {
+                "email": account_info["email"],
+                "country": account_info["country"],
+                "plan": account_info["plan"],
+                "is_premium": account_info["premium"],
+                "subscription_type": account_info["subscription_type"],
+                "token": token_result["token"],
+                "expires": token_result["expires"],
+                "login_urls": token_result["login_urls"],
+                "mode": "generate_token"
+            }
+        })
             
     except Exception as e:
         logger.error(f"Error in check_cookie: {str(e)}")
@@ -845,7 +799,7 @@ def batch_check(user):
         mode = request.form.get('mode', 'check_only')
         
         if not files:
-            return jsonify({'status': 'error', 'message': 'No files provided'}), 400
+            return jsonify({'status': 'error', 'message': 'No files provided'})
         
         is_premium_user = check_premium_status(user.id)
         
@@ -917,7 +871,7 @@ def batch_check(user):
         logger.error(f"Batch check error: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({"status": "error", "message": str(e)})
     
     finally:
         for temp_dir in temp_dirs:
@@ -1145,68 +1099,170 @@ def health():
             "FLASK_SECRET_KEY": bool(os.environ.get('FLASK_SECRET_KEY'))
         }
     })
-    
-@app.route('/api/auth/key', methods=['GET', 'OPTIONS'])
+@app.route('/api/batch-check-start', methods=['POST', 'OPTIONS'])
 @cross_origin(supports_credentials=True)
 @require_auth
-def get_encryption_key(user):
-    """Deliver encryption key to authenticated clients"""
+def batch_check_start(user):
     if request.method == 'OPTIONS':
-        response = make_response()
-        response.headers.add('Access-Control-Max-Age', '86400')
-        return response, 204
+        return '', 204
     
     try:
-
-        user_key_material = f"{user.id}:{os.environ.get('API_ENCRYPTION_KEY')}"
-        derived_key = hashlib.sha256(user_key_material.encode()).digest()
-        key_b64 = base64.urlsafe_b64encode(derived_key).decode()
+        files = request.files.getlist('files')
+        mode = request.form.get('mode', 'check_only')
         
+        if not files:
+            return jsonify({'status': 'error', 'message': 'No files provided'}), 400
+        
+        is_premium_user = check_premium_status(user.id)
+        
+        if mode == 'generate_token' and not is_premium_user:
+            return jsonify({
+                "status": "error",
+                "message": "Premium subscription required"
+            }), 403
+        
+        # Create job in database
+        job_id = create_job(user.id, len(files))
+        
+        if not job_id:
+            return jsonify({'status': 'error', 'message': 'Failed to create job'}), 500
+        
+        # Save files and process (simplified - process immediately for now)
+        # For 905 files, we need to process in background
+        # But Vercel will kill it... so we process what we can
+        
+        temp_dir = tempfile.mkdtemp(prefix=f"job_{job_id}_", dir=TEMP_DIR)
+        
+        def process_files():
+            try:
+                for index, file in enumerate(files, 1):
+                    file_path = os.path.join(temp_dir, file.filename)
+                    file.save(file_path)
+                    
+                    # Process
+                    with open(file_path, 'rb') as f:
+                        from werkzeug.datastructures import FileStorage
+                        file_storage = FileStorage(
+                            stream=f,
+                            filename=file.filename,
+                            content_type='application/octet-stream'
+                        )
+                        
+                        result = process_single_file(file_storage, mode, is_premium_user, user.id)
+                        
+                        # Update progress
+                        update_job_progress(job_id, {
+                            'current_file': file.filename,
+                            'processed': index
+                        })
+                        
+                        # Add result
+                        add_job_result(job_id, result)
+                        
+                        # Cleanup temp file
+                        try:
+                            os.remove(file_path)
+                        except:
+                            pass
+                    
+                    # Stop after 10 seconds to avoid timeout
+                    if index >= 20:  # Process max 20 files per request
+                        update_job_progress(job_id, {
+                            'status': 'partial',
+                            'current_file': f'Stopped at {index} files (timeout protection)'
+                        })
+                        break
+                
+                # Mark completed if we processed all
+                if index >= len(files):
+                    update_job_progress(job_id, {
+                        'status': 'completed',
+                        'completed_at': datetime.utcnow().isoformat()
+                    })
+                    
+            except Exception as e:
+                logger.error(f"Processing error: {e}")
+                update_job_progress(job_id, {
+                    'status': 'error',
+                    'current_file': str(e)
+                })
+            finally:
+                try:
+                    shutil.rmtree(temp_dir)
+                except:
+                    pass
+        
+        # Start processing in thread (will be killed after response, but we try)
+        import threading
+        thread = threading.Thread(target=process_files)
+        thread.daemon = True
+        thread.start()
+        
+        # Return immediately
         return jsonify({
             'status': 'success',
-            'key': key_b64,
-            'algorithm': 'AES-256-CBC',
-            'salt': crypto.salt
+            'job_id': job_id,
+            'message': 'Processing started',
+            'total_files': len(files),
+            'note': 'Processing up to 20 files per request due to timeout limits'
         })
+        
     except Exception as e:
+        logger.error(f"Batch start error: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-# ============================================
-# CRITICAL: Global OPTIONS handler for ALL routes
-# ============================================
 
-@app.before_request
-def handle_preflight():
-    """Handle CORS preflight requests globally"""
-    if request.method == "OPTIONS":
-        response = make_response()
-        response.headers.add("Access-Control-Allow-Origin", request.headers.get('Origin', '*'))
-        response.headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept, Origin")
-        response.headers.add("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-        response.headers.add("Access-Control-Allow-Credentials", "true")
-        response.headers.add("Access-Control-Max-Age", "86400")
-        return response, 204
+@app.route('/api/batch-check-status/<job_id>', methods=['GET', 'OPTIONS'])
+@cross_origin(supports_credentials=True)
+@require_auth
+def batch_check_status(user, job_id):
+    if request.method == 'OPTIONS':
+        return '', 204
+    
+    job = get_job_status(job_id)
+    
+    if not job:
+        return jsonify({'status': 'error', 'message': 'Job not found'}), 404
+    
+    # Verify ownership
+    if job.get('user_id') != user.id:
+        return jsonify({'status': 'error', 'message': 'Unauthorized'}), 403
+    
+    return jsonify({
+        'status': 'success',
+        'job_status': job.get('status'),
+        'progress': {
+            'total': job.get('total'),
+            'processed': job.get('processed', 0),
+            'valid': job.get('valid', 0),
+            'invalid': job.get('invalid', 0),
+            'percent': int((job.get('processed', 0) / job.get('total', 1)) * 100) if job.get('total') else 0,
+            'current_file': job.get('current_file', '')
+        }
+    })
 
-@app.after_request
-def after_request(response):
-    """Add CORS headers to all responses"""
-    origin = request.headers.get('Origin')
-    if origin in ALLOWED_ORIGINS:
-        response.headers.add('Access-Control-Allow-Origin', origin)
-    else:
-        # For development, you might want to allow all
-        # Remove this in production!
-        response.headers.add('Access-Control-Allow-Origin', '*')
+@app.route('/api/batch-check-results/<job_id>', methods=['GET', 'OPTIONS'])
+@cross_origin(supports_credentials=True)
+@require_auth
+def batch_check_results(user, job_id):
+    if request.method == 'OPTIONS':
+        return '', 204
     
-    response.headers.add('Access-Control-Allow-Credentials', 'true')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin')
-    response.headers.add('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-    response.headers.add('Access-Control-Expose-Headers', 'Content-Type')
+    job = get_job_status(job_id)
     
-    # Security headers
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['X-Frame-Options'] = 'DENY'
-    response.headers['X-XSS-Protection'] = '1; mode=block'
-    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    if not job:
+        return jsonify({'status': 'error', 'message': 'Job not found'}), 404
     
-    return response
+    if job.get('user_id') != user.id:
+        return jsonify({'status': 'error', 'message': 'Unauthorized'}), 403
+    
+    return jsonify({
+        'status': 'success',
+        'results': job.get('results', []),
+        'summary': {
+            'total': job.get('total'),
+            'valid': job.get('valid', 0),
+            'invalid': job.get('invalid', 0)
+        }
+    })
+    

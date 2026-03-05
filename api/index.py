@@ -896,7 +896,7 @@ def batch_check(user):
             yield f"data: {json.dumps(completion_data)}\n\n"
         
         if request.headers.get('Accept') == 'application/json':
-            for            file in files:
+            for file in files:
                 result = process_single_file(file, mode, is_premium_user, user.id)
                 results.append(result)
             

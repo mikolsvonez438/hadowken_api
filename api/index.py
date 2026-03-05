@@ -29,10 +29,6 @@ import time
 from collections import defaultdict
 
 
-job_progress = {}
-job_results = {}
-
-
 load_dotenv()
 urllib3.disable_warnings(InsecureRequestWarning)
 
@@ -1107,7 +1103,6 @@ def health():
 @cross_origin(supports_credentials=True)
 @require_auth
 def batch_check_start(user):
-    """Start batch processing job - returns immediately"""
     if request.method == 'OPTIONS':
         return '', 204
     
@@ -1126,106 +1121,90 @@ def batch_check_start(user):
                 "message": "Premium subscription required"
             }), 403
         
-        # Generate job ID
-        job_id = str(uuid.uuid4())
+        # Create job in database
+        job_id = create_job(user.id, len(files))
         
-        # Save files temporarily
+        if not job_id:
+            return jsonify({'status': 'error', 'message': 'Failed to create job'}), 500
+        
+        # Save files and process (simplified - process immediately for now)
+        # For 905 files, we need to process in background
+        # But Vercel will kill it... so we process what we can
+        
         temp_dir = tempfile.mkdtemp(prefix=f"job_{job_id}_", dir=TEMP_DIR)
-        saved_files = []
         
-        for file in files:
-            file_path = os.path.join(temp_dir, file.filename)
-            file.save(file_path)
-            saved_files.append({
-                'path': file_path,
-                'filename': file.filename,
-                'original': file
-            })
-        
-        # Initialize job status
-        job_progress[job_id] = {
-            'total': len(files),
-            'processed': 0,
-            'valid': 0,
-            'invalid': 0,
-            'status': 'processing',
-            'current_file': '',
-            'started_at': datetime.utcnow().isoformat()
-        }
-        job_results[job_id] = []
-        
-        # Start background processing
-        def process_in_background():
+        def process_files():
             try:
-                for index, file_info in enumerate(saved_files, 1):
-                    # Update progress
-                    job_progress[job_id]['current_file'] = file_info['filename']
+                for index, file in enumerate(files, 1):
+                    file_path = os.path.join(temp_dir, file.filename)
+                    file.save(file_path)
                     
-                    # Process file
-                    try:
-                        # Re-create file object from saved path
-                        with open(file_info['path'], 'rb') as f:
-                            from werkzeug.datastructures import FileStorage
-                            file_storage = FileStorage(
-                                stream=f,
-                                filename=file_info['filename'],
-                                content_type='application/octet-stream'
-                            )
-                            
-                            result = process_single_file(
-                                file_storage, 
-                                mode, 
-                                is_premium_user, 
-                                user.id
-                            )
-                            
-                            job_results[job_id].append(result)
-                            
-                            if result['status'] == 'success':
-                                job_progress[job_id]['valid'] += 1
-                            else:
-                                job_progress[job_id]['invalid'] += 1
-                                
-                    except Exception as e:
-                        logger.error(f"Error processing {file_info['filename']}: {e}")
-                        job_results[job_id].append({
-                            'status': 'error',
-                            'filename': file_info['filename'],
-                            'message': str(e)
+                    # Process
+                    with open(file_path, 'rb') as f:
+                        from werkzeug.datastructures import FileStorage
+                        file_storage = FileStorage(
+                            stream=f,
+                            filename=file.filename,
+                            content_type='application/octet-stream'
+                        )
+                        
+                        result = process_single_file(file_storage, mode, is_premium_user, user.id)
+                        
+                        # Update progress
+                        update_job_progress(job_id, {
+                            'current_file': file.filename,
+                            'processed': index
                         })
-                        job_progress[job_id]['invalid'] += 1
+                        
+                        # Add result
+                        add_job_result(job_id, result)
+                        
+                        # Cleanup temp file
+                        try:
+                            os.remove(file_path)
+                        except:
+                            pass
                     
-                    job_progress[job_id]['processed'] += 1
+                    # Stop after 10 seconds to avoid timeout
+                    if index >= 20:  # Process max 20 files per request
+                        update_job_progress(job_id, {
+                            'status': 'partial',
+                            'current_file': f'Stopped at {index} files (timeout protection)'
+                        })
+                        break
+                
+                # Mark completed if we processed all
+                if index >= len(files):
+                    update_job_progress(job_id, {
+                        'status': 'completed',
+                        'completed_at': datetime.utcnow().isoformat()
+                    })
                     
-                    # Small delay to prevent overwhelming
-                    time.sleep(0.1)
-                
-                job_progress[job_id]['status'] = 'completed'
-                job_progress[job_id]['completed_at'] = datetime.utcnow().isoformat()
-                
             except Exception as e:
-                logger.error(f"Background processing error: {e}")
-                job_progress[job_id]['status'] = 'error'
-                job_progress[job_id]['error'] = str(e)
-            
+                logger.error(f"Processing error: {e}")
+                update_job_progress(job_id, {
+                    'status': 'error',
+                    'current_file': str(e)
+                })
             finally:
-                # Cleanup temp files
                 try:
                     shutil.rmtree(temp_dir)
                 except:
                     pass
         
-        # Start thread (note: Vercel may kill this when response returns)
-        # For production, use Redis + separate worker or Supabase functions
-        thread = threading.Thread(target=process_in_background)
+        # Start processing in thread (will be killed after response, but we try)
+        import threading
+        thread = threading.Thread(target=process_files)
         thread.daemon = True
         thread.start()
         
+        # Return immediately
         return jsonify({
             'status': 'success',
             'job_id': job_id,
             'message': 'Processing started',
-            'total_files': len(files)
+            'total_files': len(files),
+            'note': 'Processing up to 20 files per request due to timeout limits'
         })
         
     except Exception as e:
@@ -1237,69 +1216,54 @@ def batch_check_start(user):
 @cross_origin(supports_credentials=True)
 @require_auth
 def batch_check_status(user, job_id):
-    """Get processing status"""
     if request.method == 'OPTIONS':
         return '', 204
     
-    if job_id not in job_progress:
+    job = get_job_status(job_id)
+    
+    if not job:
         return jsonify({'status': 'error', 'message': 'Job not found'}), 404
     
-    progress = job_progress[job_id]
+    # Verify ownership
+    if job.get('user_id') != user.id:
+        return jsonify({'status': 'error', 'message': 'Unauthorized'}), 403
     
-    response = {
+    return jsonify({
         'status': 'success',
-        'job_status': progress['status'],
+        'job_status': job.get('status'),
         'progress': {
-            'total': progress['total'],
-            'processed': progress['processed'],
-            'valid': progress['valid'],
-            'invalid': progress['invalid'],
-            'percent': int((progress['processed'] / progress['total']) * 100) if progress['total'] > 0 else 0,
-            'current_file': progress['current_file']
+            'total': job.get('total'),
+            'processed': job.get('processed', 0),
+            'valid': job.get('valid', 0),
+            'invalid': job.get('invalid', 0),
+            'percent': int((job.get('processed', 0) / job.get('total', 1)) * 100) if job.get('total') else 0,
+            'current_file': job.get('current_file', '')
         }
-    }
-    
-    # Include results if completed
-    if progress['status'] == 'completed':
-        response['results'] = job_results.get(job_id, [])
-        
-        # Cleanup after returning
-        def cleanup():
-            time.sleep(300)  # Keep for 5 minutes then cleanup
-            job_progress.pop(job_id, None)
-            job_results.pop(job_id, None)
-        
-        threading.Thread(target=cleanup).start()
-    
-    return jsonify(response)
-
+    })
 
 @app.route('/api/batch-check-results/<job_id>', methods=['GET', 'OPTIONS'])
 @cross_origin(supports_credentials=True)
 @require_auth
 def batch_check_results(user, job_id):
-    """Get final results"""
     if request.method == 'OPTIONS':
         return '', 204
     
-    if job_id not in job_progress:
+    job = get_job_status(job_id)
+    
+    if not job:
         return jsonify({'status': 'error', 'message': 'Job not found'}), 404
     
-    progress = job_progress[job_id]
-    
-    if progress['status'] != 'completed':
-        return jsonify({
-            'status': 'error', 
-            'message': 'Processing not complete',
-            'job_status': progress['status']
-        }), 400
+    if job.get('user_id') != user.id:
+        return jsonify({'status': 'error', 'message': 'Unauthorized'}), 403
     
     return jsonify({
         'status': 'success',
-        'results': job_results.get(job_id, []),
+        'results': job.get('results', []),
         'summary': {
-            'total': progress['total'],
-            'valid': progress['valid'],
-            'invalid': progress['invalid']
+            'total': job.get('total'),
+            'valid': job.get('valid', 0),
+            'invalid': job.get('invalid', 0)
         }
     })
+    
+

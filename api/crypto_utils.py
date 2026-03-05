@@ -1,17 +1,14 @@
-# api/crypto_utils.py - Pure Python, no external dependencies
+# api/crypto_utils.py - PyCryptodome version
 import os
 import json
 import base64
 import hashlib
 import hmac
 import secrets
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
 
 class PureEncryption:
-    """
-    Pure Python encryption using only standard library
-    AES-256-CBC simulation using SHA-256 + XOR
-    """
-    
     def __init__(self):
         self.master_key = self._get_key()
         self.salt = os.environ.get('ENCRYPTION_SALT', 'netflix_checker_salt_v1')
@@ -20,53 +17,30 @@ class PureEncryption:
         key = os.environ.get('API_ENCRYPTION_KEY')
         if not key:
             raise ValueError("API_ENCRYPTION_KEY required")
-        # Add padding if needed
-        padding_needed = 4 - len(key) % 4 if len(key) % 4 else 0
-        key += '=' * padding_needed
-        return base64.urlsafe_b64decode(key)
+        # Ensure 32 bytes for AES-256
+        key_bytes = base64.urlsafe_b64decode(key + '=' * (4 - len(key) % 4))
+        return hashlib.sha256(key_bytes).digest()[:32]
     
     def _derive_key(self, field_name: str) -> bytes:
-        """HKDF-like key derivation"""
+        """Derive field-specific key"""
         info = f"{self.salt}:{field_name}".encode()
-        prk = hmac.new(self.master_key, info, hashlib.sha256).digest()
-        return hashlib.sha256(prk + info).digest()
-    
-    def _encrypt_block(self, key: bytes, block: bytes, counter: int) -> bytes:
-        """Encrypt a single block using key derivation"""
-        counter_bytes = counter.to_bytes(16, 'big')
-        # Use SHA-256 to generate keystream
-        keystream = hashlib.sha256(key + counter_bytes).digest()
-        # XOR with plaintext (use only needed bytes)
-        return bytes(b ^ keystream[i] for i, b in enumerate(block))
+        return hashlib.sha256(self.master_key + info).digest()
     
     def encrypt_field(self, plaintext: str, field_name: str = "default") -> dict:
-        """Encrypt field using custom AES-like construction"""
         if not plaintext:
             return {"value": "", "encrypted": False}
         
         try:
             key = self._derive_key(field_name)
             iv = secrets.token_bytes(16)
-            data = plaintext.encode('utf-8')
-            
-            # Pad to 16-byte boundary
-            pad_len = 16 - (len(data) % 16) if len(data) % 16 else 0
-            data += bytes([pad_len] * pad_len)
-            
-            # CTR mode encryption
-            ciphertext = bytearray()
-            for i in range(0, len(data), 16):
-                block = data[i:i+16]
-                encrypted_block = self._encrypt_block(key, block, i // 16)
-                ciphertext.extend(encrypted_block)
-            
-            # HMAC for authentication
-            tag = hmac.new(key, iv + bytes(ciphertext), hashlib.sha256).digest()[:16]
+            cipher = AES.new(key, AES.MODE_CBC, iv)
+            padded = pad(plaintext.encode('utf-8'), AES.block_size)
+            ciphertext = cipher.encrypt(padded)
             
             return {
-                "v": base64.b64encode(bytes(ciphertext)).decode('utf-8'),
+                "v": base64.b64encode(ciphertext).decode('utf-8'),
                 "i": base64.b64encode(iv).decode('utf-8'),
-                "t": base64.b64encode(tag).decode('utf-8'),
+                "t": base64.b64encode(hashlib.sha256(ciphertext).digest()[:16]).decode('utf-8'),
                 "f": field_name,
                 "e": True
             }

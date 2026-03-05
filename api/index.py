@@ -24,6 +24,9 @@ from flask_limiter.util import get_remote_address
 from flask_talisman import Talisman
 import secrets
 from marshmallow import Schema, fields, validate, ValidationError
+import threading
+import time
+from collections import defaultdict
 
 load_dotenv()
 urllib3.disable_warnings(InsecureRequestWarning)
@@ -1093,5 +1096,205 @@ def health():
             "SUPABASE_URL": bool(os.environ.get('SUPABASE_URL')),
             "SUPABASE_SERVICE_KEY": bool(os.environ.get('SUPABASE_SERVICE_KEY')),
             "FLASK_SECRET_KEY": bool(os.environ.get('FLASK_SECRET_KEY'))
+        }
+    })
+@app.route('/api/batch-check-start', methods=['POST', 'OPTIONS'])
+@cross_origin(supports_credentials=True)
+@require_auth
+def batch_check_start(user):
+    """Start batch processing job - returns immediately"""
+    if request.method == 'OPTIONS':
+        return '', 204
+    
+    try:
+        files = request.files.getlist('files')
+        mode = request.form.get('mode', 'check_only')
+        
+        if not files:
+            return jsonify({'status': 'error', 'message': 'No files provided'}), 400
+        
+        is_premium_user = check_premium_status(user.id)
+        
+        if mode == 'generate_token' and not is_premium_user:
+            return jsonify({
+                "status": "error",
+                "message": "Premium subscription required"
+            }), 403
+        
+        # Generate job ID
+        job_id = str(uuid.uuid4())
+        
+        # Save files temporarily
+        temp_dir = tempfile.mkdtemp(prefix=f"job_{job_id}_", dir=TEMP_DIR)
+        saved_files = []
+        
+        for file in files:
+            file_path = os.path.join(temp_dir, file.filename)
+            file.save(file_path)
+            saved_files.append({
+                'path': file_path,
+                'filename': file.filename,
+                'original': file
+            })
+        
+        # Initialize job status
+        job_progress[job_id] = {
+            'total': len(files),
+            'processed': 0,
+            'valid': 0,
+            'invalid': 0,
+            'status': 'processing',
+            'current_file': '',
+            'started_at': datetime.utcnow().isoformat()
+        }
+        job_results[job_id] = []
+        
+        # Start background processing
+        def process_in_background():
+            try:
+                for index, file_info in enumerate(saved_files, 1):
+                    # Update progress
+                    job_progress[job_id]['current_file'] = file_info['filename']
+                    
+                    # Process file
+                    try:
+                        # Re-create file object from saved path
+                        with open(file_info['path'], 'rb') as f:
+                            from werkzeug.datastructures import FileStorage
+                            file_storage = FileStorage(
+                                stream=f,
+                                filename=file_info['filename'],
+                                content_type='application/octet-stream'
+                            )
+                            
+                            result = process_single_file(
+                                file_storage, 
+                                mode, 
+                                is_premium_user, 
+                                user.id
+                            )
+                            
+                            job_results[job_id].append(result)
+                            
+                            if result['status'] == 'success':
+                                job_progress[job_id]['valid'] += 1
+                            else:
+                                job_progress[job_id]['invalid'] += 1
+                                
+                    except Exception as e:
+                        logger.error(f"Error processing {file_info['filename']}: {e}")
+                        job_results[job_id].append({
+                            'status': 'error',
+                            'filename': file_info['filename'],
+                            'message': str(e)
+                        })
+                        job_progress[job_id]['invalid'] += 1
+                    
+                    job_progress[job_id]['processed'] += 1
+                    
+                    # Small delay to prevent overwhelming
+                    time.sleep(0.1)
+                
+                job_progress[job_id]['status'] = 'completed'
+                job_progress[job_id]['completed_at'] = datetime.utcnow().isoformat()
+                
+            except Exception as e:
+                logger.error(f"Background processing error: {e}")
+                job_progress[job_id]['status'] = 'error'
+                job_progress[job_id]['error'] = str(e)
+            
+            finally:
+                # Cleanup temp files
+                try:
+                    shutil.rmtree(temp_dir)
+                except:
+                    pass
+        
+        # Start thread (note: Vercel may kill this when response returns)
+        # For production, use Redis + separate worker or Supabase functions
+        thread = threading.Thread(target=process_in_background)
+        thread.daemon = True
+        thread.start()
+        
+        return jsonify({
+            'status': 'success',
+            'job_id': job_id,
+            'message': 'Processing started',
+            'total_files': len(files)
+        })
+        
+    except Exception as e:
+        logger.error(f"Batch start error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/batch-check-status/<job_id>', methods=['GET', 'OPTIONS'])
+@cross_origin(supports_credentials=True)
+@require_auth
+def batch_check_status(user, job_id):
+    """Get processing status"""
+    if request.method == 'OPTIONS':
+        return '', 204
+    
+    if job_id not in job_progress:
+        return jsonify({'status': 'error', 'message': 'Job not found'}), 404
+    
+    progress = job_progress[job_id]
+    
+    response = {
+        'status': 'success',
+        'job_status': progress['status'],
+        'progress': {
+            'total': progress['total'],
+            'processed': progress['processed'],
+            'valid': progress['valid'],
+            'invalid': progress['invalid'],
+            'percent': int((progress['processed'] / progress['total']) * 100) if progress['total'] > 0 else 0,
+            'current_file': progress['current_file']
+        }
+    }
+    
+    # Include results if completed
+    if progress['status'] == 'completed':
+        response['results'] = job_results.get(job_id, [])
+        
+        # Cleanup after returning
+        def cleanup():
+            time.sleep(300)  # Keep for 5 minutes then cleanup
+            job_progress.pop(job_id, None)
+            job_results.pop(job_id, None)
+        
+        threading.Thread(target=cleanup).start()
+    
+    return jsonify(response)
+
+
+@app.route('/api/batch-check-results/<job_id>', methods=['GET', 'OPTIONS'])
+@cross_origin(supports_credentials=True)
+@require_auth
+def batch_check_results(user, job_id):
+    """Get final results"""
+    if request.method == 'OPTIONS':
+        return '', 204
+    
+    if job_id not in job_progress:
+        return jsonify({'status': 'error', 'message': 'Job not found'}), 404
+    
+    progress = job_progress[job_id]
+    
+    if progress['status'] != 'completed':
+        return jsonify({
+            'status': 'error', 
+            'message': 'Processing not complete',
+            'job_status': progress['status']
+        }), 400
+    
+    return jsonify({
+        'status': 'success',
+        'results': job_results.get(job_id, []),
+        'summary': {
+            'total': progress['total'],
+            'valid': progress['valid'],
+            'invalid': progress['invalid']
         }
     })

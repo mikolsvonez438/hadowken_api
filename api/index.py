@@ -24,10 +24,6 @@ from flask_limiter.util import get_remote_address
 from flask_talisman import Talisman
 import secrets
 from marshmallow import Schema, fields, validate, ValidationError
-import threading
-import time
-from collections import defaultdict
-
 
 load_dotenv()
 urllib3.disable_warnings(InsecureRequestWarning)
@@ -799,7 +795,7 @@ def batch_check(user):
         mode = request.form.get('mode', 'check_only')
         
         if not files:
-            return jsonify({'status': 'error', 'message': 'No files provided'})
+            return jsonify({'status': 'error', 'message': 'No files provided'}), 400
         
         is_premium_user = check_premium_status(user.id)
         
@@ -849,7 +845,7 @@ def batch_check(user):
             yield f"data: {json.dumps(completion_data)}\n\n"
         
         if request.headers.get('Accept') == 'application/json':
-            for file in files:
+            for            file in files:
                 result = process_single_file(file, mode, is_premium_user, user.id)
                 results.append(result)
             
@@ -871,7 +867,7 @@ def batch_check(user):
         logger.error(f"Batch check error: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
-        return jsonify({"status": "error", "message": str(e)})
+        return jsonify({"status": "error", "message": str(e)}), 500
     
     finally:
         for temp_dir in temp_dirs:
@@ -1099,171 +1095,3 @@ def health():
             "FLASK_SECRET_KEY": bool(os.environ.get('FLASK_SECRET_KEY'))
         }
     })
-@app.route('/api/batch-check-start', methods=['POST', 'OPTIONS'])
-@cross_origin(supports_credentials=True)
-@require_auth
-def batch_check_start(user):
-    if request.method == 'OPTIONS':
-        return '', 204
-    
-    try:
-        files = request.files.getlist('files')
-        mode = request.form.get('mode', 'check_only')
-        
-        if not files:
-            return jsonify({'status': 'error', 'message': 'No files provided'}), 400
-        
-        is_premium_user = check_premium_status(user.id)
-        
-        if mode == 'generate_token' and not is_premium_user:
-            return jsonify({
-                "status": "error",
-                "message": "Premium subscription required"
-            }), 403
-        
-        # Create job in database
-        job_id = create_job(user.id, len(files))
-        
-        if not job_id:
-            return jsonify({'status': 'error', 'message': 'Failed to create job'}), 500
-        
-        # Save files and process (simplified - process immediately for now)
-        # For 905 files, we need to process in background
-        # But Vercel will kill it... so we process what we can
-        
-        temp_dir = tempfile.mkdtemp(prefix=f"job_{job_id}_", dir=TEMP_DIR)
-        
-        def process_files():
-            try:
-                for index, file in enumerate(files, 1):
-                    file_path = os.path.join(temp_dir, file.filename)
-                    file.save(file_path)
-                    
-                    # Process
-                    with open(file_path, 'rb') as f:
-                        from werkzeug.datastructures import FileStorage
-                        file_storage = FileStorage(
-                            stream=f,
-                            filename=file.filename,
-                            content_type='application/octet-stream'
-                        )
-                        
-                        result = process_single_file(file_storage, mode, is_premium_user, user.id)
-                        
-                        # Update progress
-                        update_job_progress(job_id, {
-                            'current_file': file.filename,
-                            'processed': index
-                        })
-                        
-                        # Add result
-                        add_job_result(job_id, result)
-                        
-                        # Cleanup temp file
-                        try:
-                            os.remove(file_path)
-                        except:
-                            pass
-                    
-                    # Stop after 10 seconds to avoid timeout
-                    if index >= 20:  # Process max 20 files per request
-                        update_job_progress(job_id, {
-                            'status': 'partial',
-                            'current_file': f'Stopped at {index} files (timeout protection)'
-                        })
-                        break
-                
-                # Mark completed if we processed all
-                if index >= len(files):
-                    update_job_progress(job_id, {
-                        'status': 'completed',
-                        'completed_at': datetime.utcnow().isoformat()
-                    })
-                    
-            except Exception as e:
-                logger.error(f"Processing error: {e}")
-                update_job_progress(job_id, {
-                    'status': 'error',
-                    'current_file': str(e)
-                })
-            finally:
-                try:
-                    shutil.rmtree(temp_dir)
-                except:
-                    pass
-        
-        # Start processing in thread (will be killed after response, but we try)
-        import threading
-        thread = threading.Thread(target=process_files)
-        thread.daemon = True
-        thread.start()
-        
-        # Return immediately
-        return jsonify({
-            'status': 'success',
-            'job_id': job_id,
-            'message': 'Processing started',
-            'total_files': len(files),
-            'note': 'Processing up to 20 files per request due to timeout limits'
-        })
-        
-    except Exception as e:
-        logger.error(f"Batch start error: {e}")
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-
-@app.route('/api/batch-check-status/<job_id>', methods=['GET', 'OPTIONS'])
-@cross_origin(supports_credentials=True)
-@require_auth
-def batch_check_status(user, job_id):
-    if request.method == 'OPTIONS':
-        return '', 204
-    
-    job = get_job_status(job_id)
-    
-    if not job:
-        return jsonify({'status': 'error', 'message': 'Job not found'}), 404
-    
-    # Verify ownership
-    if job.get('user_id') != user.id:
-        return jsonify({'status': 'error', 'message': 'Unauthorized'}), 403
-    
-    return jsonify({
-        'status': 'success',
-        'job_status': job.get('status'),
-        'progress': {
-            'total': job.get('total'),
-            'processed': job.get('processed', 0),
-            'valid': job.get('valid', 0),
-            'invalid': job.get('invalid', 0),
-            'percent': int((job.get('processed', 0) / job.get('total', 1)) * 100) if job.get('total') else 0,
-            'current_file': job.get('current_file', '')
-        }
-    })
-
-@app.route('/api/batch-check-results/<job_id>', methods=['GET', 'OPTIONS'])
-@cross_origin(supports_credentials=True)
-@require_auth
-def batch_check_results(user, job_id):
-    if request.method == 'OPTIONS':
-        return '', 204
-    
-    job = get_job_status(job_id)
-    
-    if not job:
-        return jsonify({'status': 'error', 'message': 'Job not found'}), 404
-    
-    if job.get('user_id') != user.id:
-        return jsonify({'status': 'error', 'message': 'Unauthorized'}), 403
-    
-    return jsonify({
-        'status': 'success',
-        'results': job.get('results', []),
-        'summary': {
-            'total': job.get('total'),
-            'valid': job.get('valid', 0),
-            'invalid': job.get('invalid', 0)
-        }
-    })
-    
-

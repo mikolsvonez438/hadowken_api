@@ -24,12 +24,16 @@ from flask_limiter.util import get_remote_address
 from flask_talisman import Talisman
 import secrets
 from marshmallow import Schema, fields, validate, ValidationError
+from .crypto_utils import encrypt_api_response, create_encrypted_wrapper, crypto
+from .middleware import init_encryption_middleware, require_encryption
+
 
 load_dotenv()
 urllib3.disable_warnings(InsecureRequestWarning)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
+
 
 # Vercel-compatible limiter (memory storage acceptable for serverless)
 limiter = Limiter(app=app, key_func=get_remote_address, default_limits=[])
@@ -44,6 +48,8 @@ Talisman(app,
         'style-src': "'self' 'unsafe-inline'"
     }
 )
+
+init_encryption_middleware(app)
 
 # Fixed CORS - removed wildcard with credentials
 ALLOWED_ORIGINS = [

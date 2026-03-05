@@ -28,6 +28,11 @@ import threading
 import time
 from collections import defaultdict
 
+
+job_progress = {}
+job_results = {}
+
+
 load_dotenv()
 urllib3.disable_warnings(InsecureRequestWarning)
 

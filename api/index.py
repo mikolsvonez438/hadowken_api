@@ -14,6 +14,7 @@ import tempfile
 import shutil
 import uuid
 import hashlib
+import base64  # Add this
 from datetime import datetime
 from supabase import create_client, Client
 from gotrue.errors import AuthApiError
@@ -27,21 +28,50 @@ from marshmallow import Schema, fields, validate, ValidationError
 from .crypto_utils import encrypt_api_response, create_encrypted_wrapper, crypto
 from .middleware import init_encryption_middleware, require_encryption
 
-
 load_dotenv()
 urllib3.disable_warnings(InsecureRequestWarning)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 
+# ============================================
+# CORS - MUST BE BEFORE OTHER MIDDLEWARE
+# ============================================
 
-# Vercel-compatible limiter (memory storage acceptable for serverless)
+# Allow your frontend domain
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:5000",
+    "http://localhost:8080",
+    "https://hakdowken.vercel.app",  # Your frontend - NO TRAILING SPACE!
+]
+
+# Simple CORS setup first
+CORS(app, 
+    resources={
+        r"/api/*": {
+            "origins": ALLOWED_ORIGINS,
+            "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin", "X-API-Key"],
+            "expose_headers": ["Content-Type", "X-Request-Id"],
+            "supports_credentials": True,
+            "max_age": 86400
+        }
+    },
+    supports_credentials=True
+)
+
+# ============================================
+# Security (after CORS)
+# ============================================
+
 limiter = Limiter(app=app, key_func=get_remote_address, default_limits=[])
 
-# Production-ready Talisman
+# Disable Talisman for API routes or configure properly
+# Talisman can interfere with CORS if not configured right
 Talisman(app, 
-    force_https=False,
-    strict_transport_security=True,
+    force_https=False,  # Vercel handles HTTPS
+    strict_transport_security=False,  # Disable HSTS for now
     content_security_policy={
         'default-src': "'self'",
         'script-src': "'self'",
@@ -51,31 +81,11 @@ Talisman(app,
 
 init_encryption_middleware(app)
 
-# Fixed CORS - removed wildcard with credentials
-ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://localhost:5000",
-    "http://localhost:8080",
-    "https://hakdowken.vercel.app",
-]
-
-CORS(app, resources={
-    r"/api/*": {
-        "origins": ALLOWED_ORIGINS,
-        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"],
-        "supports_credentials": True,
-        "max_age": 86400
-    }
-})
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Vercel temp directory
 TEMP_DIR = "/tmp"
 
-# Supabase configuration
 SUPABASE_URL = os.environ.get('SUPABASE_URL', 'your-supabase-url')
 SUPABASE_SERVICE_KEY = os.environ.get('SUPABASE_SERVICE_KEY', 'your-service-role-key')
 SUPABASE_ANON_KEY = os.environ.get('SUPABASE_ANON_KEY', 'your-anon-key')
@@ -596,8 +606,8 @@ def test():
     return jsonify({"status": "ok", "message": "API is working!"})
 
 @app.route('/api/auth/login', methods=['POST', 'OPTIONS'])
-@cross_origin(supports_credentials=True)
 def login():
+    # Handle OPTIONS
     if request.method == 'OPTIONS':
         response = make_response()
         response.headers.add('Access-Control-Max-Age', '86400')
@@ -609,7 +619,7 @@ def login():
         password = data.get('password')
         
         if not email or not password:
-            return jsonify({'status': 'error', 'message': 'Email and password required'})
+            return jsonify({'status': 'error', 'message': 'Email and password required'}), 400
         
         auth_response = supabase.auth.sign_in_with_password({
             "email": email,
@@ -633,6 +643,7 @@ def login():
             }
         }
         
+        # Encrypt sensitive fields
         sensitive_fields = ['access_token', 'refresh_token', 'email', 'id']
         encrypted_data = {
             'status': 'success',
@@ -644,9 +655,10 @@ def login():
         return jsonify(encrypted_data)
         
     except AuthApiError as e:
-        return jsonify({'status': 'error', 'message': 'Invalid credentials'})
+        return jsonify({'status': 'error', 'message': 'Invalid credentials'}), 401
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)})
+        logger.error(f"Login error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/api/auth/logout', methods=['POST', 'OPTIONS'])
 @cross_origin(supports_credentials=True)
@@ -1159,3 +1171,43 @@ def get_encryption_key(user):
         })
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
+# ============================================
+# CRITICAL: Global OPTIONS handler for ALL routes
+# ============================================
+
+@app.before_request
+def handle_preflight():
+    """Handle CORS preflight requests globally"""
+    if request.method == "OPTIONS":
+        response = make_response()
+        response.headers.add("Access-Control-Allow-Origin", request.headers.get('Origin', '*'))
+        response.headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept, Origin")
+        response.headers.add("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        response.headers.add("Access-Control-Allow-Credentials", "true")
+        response.headers.add("Access-Control-Max-Age", "86400")
+        return response, 204
+
+@app.after_request
+def after_request(response):
+    """Add CORS headers to all responses"""
+    origin = request.headers.get('Origin')
+    if origin in ALLOWED_ORIGINS:
+        response.headers.add('Access-Control-Allow-Origin', origin)
+    else:
+        # For development, you might want to allow all
+        # Remove this in production!
+        response.headers.add('Access-Control-Allow-Origin', '*')
+    
+    response.headers.add('Access-Control-Allow-Credentials', 'true')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin')
+    response.headers.add('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+    response.headers.add('Access-Control-Expose-Headers', 'Content-Type')
+    
+    # Security headers
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    
+    return response

@@ -1146,17 +1146,15 @@ def get_encryption_key(user):
         return response, 204
     
     try:
-        # Return the public-facing encryption key
-        # In production, you might want to rotate this or use user-specific keys
-        key = os.environ.get('API_ENCRYPTION_KEY')
-        if not key:
-            # Generate and return a session-specific key
-            key = base64.urlsafe_b64encode(AESGCM.generate_key(bit_length=256)).decode()
-            
+
+        user_key_material = f"{user.id}:{os.environ.get('API_ENCRYPTION_KEY')}"
+        derived_key = hashlib.sha256(user_key_material.encode()).digest()
+        key_b64 = base64.urlsafe_b64encode(derived_key).decode()
+        
         return jsonify({
             'status': 'success',
-            'key': key,
-            'algorithm': 'AES-256-GCM',
+            'key': key_b64,
+            'algorithm': 'AES-256-CBC',
             'salt': crypto.salt
         })
     except Exception as e:

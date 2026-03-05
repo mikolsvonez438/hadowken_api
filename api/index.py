@@ -618,7 +618,8 @@ def login():
         
         profile = supabase.table('user_profiles').select('*').eq('id', auth_response.user.id).single().execute()
         
-        return jsonify({
+        # Prepare response data
+        response_data = {
             'status': 'success',
             'session': {
                 'access_token': auth_response.session.access_token,
@@ -630,7 +631,18 @@ def login():
                 'email': auth_response.user.email,
                 'is_premium': profile.data.get('is_premium', False) if profile.data else False
             }
-        })
+        }
+        
+        sensitive_fields = ['access_token', 'refresh_token', 'email', 'id']
+        encrypted_data = {
+            'status': 'success',
+            'encrypted': True,
+            'version': '1.0',
+            'data': crypto.encrypt_response_data(response_data, sensitive_fields)
+        }
+        
+        return jsonify(encrypted_data)
+        
     except AuthApiError as e:
         return jsonify({'status': 'error', 'message': 'Invalid credentials'})
     except Exception as e:

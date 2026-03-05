@@ -735,19 +735,28 @@ def check_cookie(user):
                     token=None
                 )
                 logger.info(f"Logged check for account {account_db_id}")
-            
-            return jsonify({
-                "status": "success",
-                "data": {
-                    "email": account_info["email"],
-                    "country": account_info["country"],
-                    "plan": account_info["plan"],
-                    "is_premium": account_info["premium"],
-                    "subscription_type": account_info["subscription_type"],
-                    "mode": "check_only",
-                    "stored_in_db": account_info["ok"] and account_info["premium"]
-                }
-            })
+            response_data = {
+                "email": account_info["email"],
+                "country": account_info["country"],
+                "plan": account_info["plan"],
+                "is_premium": account_info["premium"],
+                "subscription_type": account_info["subscription_type"],
+                "mode": "check_only",
+                "stored_in_db": account_info["ok"] and account_info["premium"]
+            }
+            return jsonify(create_encrypted_wrapper(response_data, status="success"))
+            # return jsonify({
+            #     "status": "success",
+            #     "data": {
+            #         "email": account_info["email"],
+            #         "country": account_info["country"],
+            #         "plan": account_info["plan"],
+            #         "is_premium": account_info["premium"],
+            #         "subscription_type": account_info["subscription_type"],
+            #         "mode": "check_only",
+            #         "stored_in_db": account_info["ok"] and account_info["premium"]
+            #     }
+            # })
         
         token_result = generate_token(netflix_id)
         
@@ -765,21 +774,33 @@ def check_cookie(user):
                 token=token_result["token"]
             )
             logger.info(f"Logged token generation for account {account_db_id}")
-        
-        return jsonify({
-            "status": "success",
-            "data": {
-                "email": account_info["email"],
-                "country": account_info["country"],
-                "plan": account_info["plan"],
-                "is_premium": account_info["premium"],
-                "subscription_type": account_info["subscription_type"],
-                "token": token_result["token"],
-                "expires": token_result["expires"],
-                "login_urls": token_result["login_urls"],
-                "mode": "generate_token"
-            }
-        })
+            
+        response_data = {
+            "email": account_info["email"],
+            "country": account_info["country"],
+            "plan": account_info["plan"],
+            "is_premium": account_info["premium"],
+            "subscription_type": account_info["subscription_type"],
+            "token": token_result["token"],
+            "expires": token_result["expires"],
+            "login_urls": token_result["login_urls"],
+            "mode": "generate_token"
+        }
+        return sonify(create_encrypted_wrapper(response_data, status="success"))
+        # return jsonify({
+        #     "status": "success",
+        #     "data": {
+        #         "email": account_info["email"],
+        #         "country": account_info["country"],
+        #         "plan": account_info["plan"],
+        #         "is_premium": account_info["premium"],
+        #         "subscription_type": account_info["subscription_type"],
+        #         "token": token_result["token"],
+        #         "expires": token_result["expires"],
+        #         "login_urls": token_result["login_urls"],
+        #         "mode": "generate_token"
+        #     }
+        # })
             
     except Exception as e:
         logger.error(f"Error in check_cookie: {str(e)}")

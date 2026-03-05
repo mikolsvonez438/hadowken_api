@@ -798,7 +798,7 @@ def check_cookie(user):
             "login_urls": token_result["login_urls"],
             "mode": "generate_token"
         }
-        return sonify(create_encrypted_wrapper(response_data, status="success"))
+        return jsonify(create_encrypted_wrapper(response_data, status="success"))
         # return jsonify({
         #     "status": "success",
         #     "data": {

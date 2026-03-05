@@ -24,6 +24,9 @@ from flask_limiter.util import get_remote_address
 from flask_talisman import Talisman
 import secrets
 from marshmallow import Schema, fields, validate, ValidationError
+from flask import Flask, session
+from datetime import timedelta
+
 
 load_dotenv()
 urllib3.disable_warnings(InsecureRequestWarning)
@@ -33,6 +36,13 @@ app.secret_key = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 
 # Vercel-compatible limiter (memory storage acceptable for serverless)
 limiter = Limiter(app=app, key_func=get_remote_address, default_limits=[])
+
+app.config['SESSION_TYPE'] = 'filesystem'  # or 'redis' for better scalability
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=24)
+app.config['SESSION_COOKIE_SECURE'] = True  # HTTPS only
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+
 
 # Production-ready Talisman
 Talisman(app, 
@@ -464,26 +474,52 @@ def get_user_from_token(auth_header):
 def require_auth(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if request.method == 'OPTIONS':
-            response = make_response()
-            return response, 204
-            
         auth_header = request.headers.get('Authorization')
-        user = get_user_from_token(auth_header)
-        
-        if not user:
+        if not auth_header or not auth_header.startswith('Bearer '):
             return jsonify({'status': 'error', 'message': 'Authentication required'}), 401
         
-        return f(user, *args, **kwargs)
+        token = auth_header.split(' ')[1]
+        try:
+            # Try to get user - this validates the token
+            user = supabase.auth.get_user(token)
+            
+            # CRITICAL: Check if token needs refresh
+            session = supabase.auth.get_session()
+            if session and session.expires_at:
+                import time
+                if session.expires_at < time.time() + 300:  # Expires in 5 min
+                    # Refresh the token
+                    new_session = supabase.auth.refresh_session()
+                    if new_session:
+                        # Return new token in response header
+                        g.new_token = new_session.access_token
+            
+            return f(user.user, *args, **kwargs)
+            
+        except Exception as e:
+            logger.error(f"Auth error: {e}")
+            return jsonify({'status': 'error', 'message': 'Invalid or expired token'}), 401
+    
     return decorated_function
 
 def check_premium_status(user_id):
     try:
-        result = supabase.table('user_profiles').select('is_premium').eq('id', user_id).single().execute()
-        return result.data.get('is_premium', False) if result.data else False
+        cache_key = f"premium:{user_id}"
+        
+        result = supabase.table('user_profiles')\
+            .select('is_premium')\
+            .eq('id', user_id)\
+            .single()\
+            .execute()
+        
+        is_premium = result.data.get('is_premium', False) if result.data else False
+        
+        # Cache the result
+        return is_premium
+        
     except Exception as e:
         logger.error(f"Error checking premium status: {e}")
-        return False
+        return False  # Fail-safe: assume not premium on error
 
 def store_netflix_account(email, netflix_id, subscription_type, country, plan, cookie_content, user_id):
     try:

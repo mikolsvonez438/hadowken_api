@@ -28,6 +28,7 @@ app.secret_key = os.environ.get('FLASK_SECRET_KEY') or os.urandom(32)
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://localhost:5000",
+    "http://localhost",
     "https://hakdowken.vercel.app",
 ]
 

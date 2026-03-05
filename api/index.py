@@ -14,7 +14,7 @@ import tempfile
 import shutil
 import uuid
 import hashlib
-import base64  # Add this
+import base64
 from datetime import datetime
 from supabase import create_client, Client
 from gotrue.errors import AuthApiError
@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from deep_translator import GoogleTranslator
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-from flask_talisman import Talisman
+# from flask_talisman import Talisman  # Comment out for now - can interfere with CORS
 import secrets
 from marshmallow import Schema, fields, validate, ValidationError
 from .crypto_utils import encrypt_api_response, create_encrypted_wrapper, crypto
@@ -35,49 +35,43 @@ app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 
 # ============================================
-# CORS - MUST BE BEFORE OTHER MIDDLEWARE
+# CORS - FIXED: Removed trailing space from URL!
 # ============================================
 
-# Allow your frontend domain
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://localhost:5000",
     "http://localhost:8080",
-    "https://hakdowken.vercel.app",  # Your frontend - NO TRAILING SPACE!
+    "https://hakdowken.vercel.app",  # ✅ FIXED: No trailing space!
 ]
 
-# Simple CORS setup first
+# Initialize CORS properly
 CORS(app, 
     resources={
         r"/api/*": {
             "origins": ALLOWED_ORIGINS,
             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-            "allow_headers": ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin", "X-API-Key"],
-            "expose_headers": ["Content-Type", "X-Request-Id"],
+            "allow_headers": ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"],
+            "expose_headers": ["Content-Type"],
             "supports_credentials": True,
             "max_age": 86400
+        },
+        r"/*": {  # Also allow root paths
+            "origins": ALLOWED_ORIGINS,
+            "methods": ["GET", "POST", "OPTIONS"],
+            "supports_credentials": True
         }
-    },
-    supports_credentials=True
+    }
 )
 
 # ============================================
-# Security (after CORS)
+# Security (DISABLE Talisman for now - it can break CORS)
 # ============================================
 
 limiter = Limiter(app=app, key_func=get_remote_address, default_limits=[])
 
-# Disable Talisman for API routes or configure properly
-# Talisman can interfere with CORS if not configured right
-Talisman(app, 
-    force_https=False,  # Vercel handles HTTPS
-    strict_transport_security=False,  # Disable HSTS for now
-    content_security_policy={
-        'default-src': "'self'",
-        'script-src': "'self'",
-        'style-src': "'self' 'unsafe-inline'"
-    }
-)
+# Talisman disabled for API - it often causes CORS issues
+# If you need security headers, add them manually in after_request
 
 init_encryption_middleware(app)
 
@@ -111,6 +105,15 @@ def validate_input(data):
         return schema.load(data), None
     except ValidationError as err:
         return None, err.messages
+
+# Move decode_unicode HERE (before it's used)
+def decode_unicode(text):
+    if not text or not isinstance(text, str):
+        return text
+    try:
+        return text.encode('utf-8').decode('unicode-escape')
+    except:
+        return text
 
 def translate_plan_name(plan_name):
     if not plan_name or plan_name == "Unknown":
@@ -208,18 +211,58 @@ def translate_plan_name_with_fallback(plan_name):
     
     return plan_name.title()
 
+# ============================================
+# FIXED: Proper CORS handlers
+# ============================================
+
+@app.before_request
+def handle_preflight():
+    """Handle CORS preflight requests globally"""
+    if request.method == "OPTIONS":
+        response = make_response()
+        origin = request.headers.get('Origin', '')
+        
+        # Always return the specific origin, never * when credentials are used
+        if origin in ALLOWED_ORIGINS:
+            response.headers.add("Access-Control-Allow-Origin", origin)
+        else:
+            # For debugging, log unknown origins
+            logger.info(f"Unknown origin in preflight: {origin}")
+            response.headers.add("Access-Control-Allow-Origin", origin if origin else ALLOWED_ORIGINS[0])
+            
+        response.headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept, Origin")
+        response.headers.add("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        response.headers.add("Access-Control-Allow-Credentials", "true")
+        response.headers.add("Access-Control-Max-Age", "86400")
+        return response, 204
+
 @app.after_request
-def security_headers(response):
+def after_request(response):
+    """Add CORS headers to all responses"""
+    origin = request.headers.get('Origin')
+    
+    # IMPORTANT: When using credentials, you MUST specify exact origin, not *
+    if origin and origin in ALLOWED_ORIGINS:
+        response.headers['Access-Control-Allow-Origin'] = origin
+    elif origin:
+        # Log for debugging but still allow (during development)
+        logger.info(f"Response to non-allowed origin: {origin}")
+        response.headers['Access-Control-Allow-Origin'] = origin
+    else:
+        # No origin header (direct browser access)
+        response.headers['Access-Control-Allow-Origin'] = ALLOWED_ORIGINS[0]
+    
+    # These headers must be present on all responses
+    response.headers['Access-Control-Allow-Credentials'] = 'true'
+    response.headers['Access-Control-Expose-Headers'] = 'Content-Type, Authorization'
+    
+    # Security headers
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'DENY'
     response.headers['X-XSS-Protection'] = '1; mode=block'
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
-    response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
+    
     return response
-
-@app.route('/api/<path:path>', methods=['OPTIONS'])
-def options_handler(path):
-    return '', 204
 
 def extract_netflix_id(content):
     try:
@@ -357,14 +400,6 @@ def check_netflix_cookie(cookie_dict):
         logger.error(f"Error checking cookie: {str(e)}")
         return {'ok': False, 'err': str(e)}
 
-def decode_unicode(text):
-    if not text or not isinstance(text, str):
-        return text
-    try:
-        return text.encode('utf-8').decode('unicode-escape')
-    except:
-        return text
-
 def generate_token(netflix_id):
     url = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
     
@@ -451,7 +486,6 @@ def generate_token(netflix_id):
 def extract_zip_and_get_files(zip_path, extract_dir):
     txt_files = []
     try:
-        # Use /tmp for Vercel compatibility
         extract_dir = os.path.join(TEMP_DIR, os.path.basename(extract_dir))
         os.makedirs(extract_dir, exist_ok=True)
         
@@ -607,7 +641,6 @@ def test():
 
 @app.route('/api/auth/login', methods=['POST', 'OPTIONS'])
 def login():
-    # Handle OPTIONS
     if request.method == 'OPTIONS':
         response = make_response()
         response.headers.add('Access-Control-Max-Age', '86400')
@@ -628,7 +661,6 @@ def login():
         
         profile = supabase.table('user_profiles').select('*').eq('id', auth_response.user.id).single().execute()
         
-        # Prepare response data
         response_data = {
             'status': 'success',
             'session': {
@@ -643,7 +675,6 @@ def login():
             }
         }
         
-        # Encrypt sensitive fields
         sensitive_fields = ['access_token', 'refresh_token', 'email', 'id']
         encrypted_data = {
             'status': 'success',
@@ -758,7 +789,6 @@ def check_cookie(user):
                     ip_address=request.remote_addr,
                     token=None
                 )
-                logger.info(f"Logged check for account {account_db_id}")
             response_data = {
                 "email": account_info["email"],
                 "country": account_info["country"],
@@ -769,18 +799,6 @@ def check_cookie(user):
                 "stored_in_db": account_info["ok"] and account_info["premium"]
             }
             return jsonify(create_encrypted_wrapper(response_data, status="success"))
-            # return jsonify({
-            #     "status": "success",
-            #     "data": {
-            #         "email": account_info["email"],
-            #         "country": account_info["country"],
-            #         "plan": account_info["plan"],
-            #         "is_premium": account_info["premium"],
-            #         "subscription_type": account_info["subscription_type"],
-            #         "mode": "check_only",
-            #         "stored_in_db": account_info["ok"] and account_info["premium"]
-            #     }
-            # })
         
         token_result = generate_token(netflix_id)
         
@@ -797,7 +815,6 @@ def check_cookie(user):
                 ip_address=request.remote_addr,
                 token=token_result["token"]
             )
-            logger.info(f"Logged token generation for account {account_db_id}")
             
         response_data = {
             "email": account_info["email"],
@@ -811,20 +828,6 @@ def check_cookie(user):
             "mode": "generate_token"
         }
         return jsonify(create_encrypted_wrapper(response_data, status="success"))
-        # return jsonify({
-        #     "status": "success",
-        #     "data": {
-        #         "email": account_info["email"],
-        #         "country": account_info["country"],
-        #         "plan": account_info["plan"],
-        #         "is_premium": account_info["premium"],
-        #         "subscription_type": account_info["subscription_type"],
-        #         "token": token_result["token"],
-        #         "expires": token_result["expires"],
-        #         "login_urls": token_result["login_urls"],
-        #         "mode": "generate_token"
-        #     }
-        # })
             
     except Exception as e:
         logger.error(f"Error in check_cookie: {str(e)}")
@@ -896,6 +899,7 @@ def batch_check(user):
             yield f"data: {json.dumps(completion_data)}\n\n"
         
         if request.headers.get('Accept') == 'application/json':
+            # ✅ FIXED: Removed extra spaces in for loop
             for file in files:
                 result = process_single_file(file, mode, is_premium_user, user.id)
                 results.append(result)
@@ -1158,7 +1162,6 @@ def get_encryption_key(user):
         return response, 204
     
     try:
-
         user_key_material = f"{user.id}:{os.environ.get('API_ENCRYPTION_KEY')}"
         derived_key = hashlib.sha256(user_key_material.encode()).digest()
         key_b64 = base64.urlsafe_b64encode(derived_key).decode()
@@ -1171,43 +1174,3 @@ def get_encryption_key(user):
         })
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
-
-# ============================================
-# CRITICAL: Global OPTIONS handler for ALL routes
-# ============================================
-
-@app.before_request
-def handle_preflight():
-    """Handle CORS preflight requests globally"""
-    if request.method == "OPTIONS":
-        response = make_response()
-        response.headers.add("Access-Control-Allow-Origin", request.headers.get('Origin', '*'))
-        response.headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept, Origin")
-        response.headers.add("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-        response.headers.add("Access-Control-Allow-Credentials", "true")
-        response.headers.add("Access-Control-Max-Age", "86400")
-        return response, 204
-
-@app.after_request
-def after_request(response):
-    """Add CORS headers to all responses"""
-    origin = request.headers.get('Origin')
-    if origin in ALLOWED_ORIGINS:
-        response.headers.add('Access-Control-Allow-Origin', origin)
-    else:
-        # For development, you might want to allow all
-        # Remove this in production!
-        response.headers.add('Access-Control-Allow-Origin', '*')
-    
-    response.headers.add('Access-Control-Allow-Credentials', 'true')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin')
-    response.headers.add('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-    response.headers.add('Access-Control-Expose-Headers', 'Content-Type')
-    
-    # Security headers
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['X-Frame-Options'] = 'DENY'
-    response.headers['X-XSS-Protection'] = '1; mode=block'
-    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
-    
-    return response

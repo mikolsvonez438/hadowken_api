@@ -632,37 +632,62 @@ def check_premium_status(user_id):
 
 def store_netflix_account(email, netflix_id, subscription_type, country, plan, cookie_content, user_id, signup_country=None, detection_method=None):
     try:
-        existing = supabase.table('netflix_accounts').select('id').eq('email', email).execute()
+        headers = {
+            'apikey': SUPABASE_SERVICE_KEY,
+            'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
+            'Content-Type': 'application/json',
+            'Prefer': 'return=representation'
+        }
+        check_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?select=id&email=eq.{urllib.parse.quote(email, safe='')}"
+        check_resp = requests.get(check_url, headers=headers)
+        existing = check_resp.json() if check_resp.status_code == 200 else []
+        #existing = supabase.table('netflix_accounts').select('id').eq('email', email).execute()
         
         account_data = {
             'email': email,
             'netflix_id': netflix_id,
             'subscription_type': subscription_type,
-            'country': country,                    # Current detected country
-            'signup_country': signup_country or country,  # Where account was created
+            'country': country,
+            'signup_country': signup_country or country,
             'plan': plan,
             'is_premium': True,
             'cookie_data': cookie_content[:500] if cookie_content else None,
-            'added_by': user_id,
+            'added_by': str(user_id),
             'last_checked': datetime.utcnow().isoformat(),
             'is_active': True,
-            'detection_method': detection_method   # How we detected the country
+            'detection_method': detection_method
         }
         
-        if existing.data:
-            account_id = existing.data[0]['id']
-            result = supabase.table('netflix_accounts').update(account_data).eq('id', account_id).execute()
+        if existing and len(existing) > 0:
+            account_id = existing[0]['id']
+            update_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?id=eq.{account_id}"
+            resp = requests.patch(update_url, headers=headers, json=account_data)
         else:
-            result = supabase.table('netflix_accounts').insert(account_data).execute()
+            insert_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts"
+            resp = requests.post(insert_url, headers=headers, json=account_data)
+        
+        if resp.status_code in [200, 201]:
+            result_data = resp.json()
+            return True, result_data[0] if isinstance(result_data, list) and result_data else None
+        else:
+            logger.error(f"DB Error {resp.status_code}: {resp.text}")
+            return False, None
             
-        return True, result.data[0] if result.data else None
     except Exception as e:
-        logger.error(f"Error storing account: {e}")
+        logger.error(f"Exception storing account: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return False, None
+        
 
 def log_token_generation(account_id, user_id, ip_address, token=None):
     try:
-        logger.info(f"Attempting to log: account_id={account_id}, user_id={user_id}, ip={ip_address}")
+        headers = {
+            'apikey': SUPABASE_SERVICE_KEY,
+            'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
+            'Content-Type': 'application/json',
+            'Prefer': 'return=representation'
+        }
         
         log_data = {
             'account_id': str(account_id),
@@ -674,9 +699,15 @@ def log_token_generation(account_id, user_id, ip_address, token=None):
             log_data['token_hash'] = hashlib.sha256(token.encode()).hexdigest()[:32]
             log_data['token'] = token[:100]
         
-        result = supabase.table('token_logs').insert(log_data).execute()
-        logger.info(f"Token log SUCCESS: {result.data}")
-        return True
+        url = f"{SUPABASE_URL}/rest/v1/token_logs"
+        resp = requests.post(url, headers=headers, json=log_data)
+        
+        if resp.status_code == 201:
+            logger.info(f"Token log SUCCESS")
+            return True
+        else:
+            logger.error(f"Token log FAILED: {resp.status_code} - {resp.text}")
+            return False
         
     except Exception as e:
         logger.error(f"Token log FAILED: {str(e)}")

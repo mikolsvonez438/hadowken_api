@@ -1131,3 +1131,89 @@ def health():
             "FLASK_SECRET_KEY": bool(os.environ.get('FLASK_SECRET_KEY'))
         }
     })
+
+@app.route('/api/cron/validate-accounts', methods=['GET', 'POST'])
+def cron_validate_accounts():
+    # Verify it's from Vercel Cron (optional security)
+    auth_header = request.headers.get('Authorization')
+    cron_secret = os.environ.get('CRON_SECRET')
+    
+    if cron_secret and auth_header != f"Bearer {cron_secret}":
+        # Also allow Vercel's internal requests
+        if request.headers.get('User-Agent') != 'Vercel Cron':
+            return jsonify({'status': 'unauthorized'}), 401
+    
+    try:
+        # Get all active premium accounts
+        accounts = supabase.table('netflix_accounts')\
+            .select('*')\
+            .eq('is_active', True)\
+            .execute()
+        
+        if not accounts.data:
+            return jsonify({'status': 'success', 'message': 'No accounts to check', 'checked': 0})
+        
+        results = {'valid': 0, 'invalid': 0, 'updated': 0, 'errors': []}
+        
+        for account in accounts.data:
+            try:
+                # Check if cookie is still valid
+                netflix_id = account.get('netflix_id')
+                cookie_data = account.get('cookie_data', '')
+                
+                if not netflix_id:
+                    continue
+                
+                # Reconstruct minimal cookie dict for checking
+                account_info = check_netflix_cookie({"NetflixId": netflix_id})
+                
+                if account_info['ok']:
+                    # Still valid - update last_checked and refresh data
+                    update_data = {
+                        'last_checked': datetime.utcnow().isoformat(),
+                        'plan': account_info['plan'],
+                        'subscription_type': account_info['subscription_type'],
+                        'country': account_info['country'],
+                        'is_active': True,
+                        'is_premium': account_info['premium']
+                    }
+                    
+                    supabase.table('netflix_accounts')\
+                        .update(update_data)\
+                        .eq('id', account['id'])\
+                        .execute()
+                    
+                    results['valid'] += 1
+                    results['updated'] += 1
+                    
+                else:
+                    # Cookie dead - mark as inactive
+                    supabase.table('netflix_accounts')\
+                        .update({
+                            'is_active': False,
+                            'last_checked': datetime.utcnow().isoformat(),
+                            'deactivated_reason': account_info.get('err', 'Invalid cookie'),
+                            'deactivated_at': datetime.utcnow().isoformat()
+                        })\
+                        .eq('id', account['id'])\
+                        .execute()
+                    
+                    results['invalid'] += 1
+                    
+                # Small delay to avoid rate limiting
+                time.sleep(1)
+                
+            except Exception as e:
+                results['errors'].append({'account_id': account['id'], 'error': str(e)})
+                logger.error(f"Error checking account {account['id']}: {e}")
+                continue
+        
+        return jsonify({
+            'status': 'success',
+            'checked': len(accounts.data),
+            'results': results
+        })
+        
+    except Exception as e:
+        logger.error(f"Cron job failed: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500

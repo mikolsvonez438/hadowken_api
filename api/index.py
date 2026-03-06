@@ -267,6 +267,7 @@ def extract_netflix_id(content):
 def check_netflix_cookie(cookie_dict):
     session = requests.Session()
     session.cookies.update(cookie_dict)
+    
     url = 'https://www.netflix.com/YourAccount'
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -288,6 +289,7 @@ def check_netflix_cookie(cookie_dict):
             m = re.search(pattern, txt, flags)
             return m.group(1).strip() if m else "Unknown"
 
+        # === PLAN DETECTION (keep existing) ===
         raw_plan = find(r'"planName"\s*:\s*"([^"]+)"')
         if raw_plan == "Unknown":
             raw_plan = find(r'localizedPlanName[^}]+"value":"([^"]+)"')
@@ -296,16 +298,111 @@ def check_netflix_cookie(cookie_dict):
         if raw_plan == "Unknown":
             raw_plan = find(r'"plan"\s*:\s*"([^"]+)"')
         
-        if raw_plan == "Unknown":
-            plan_match = re.search(r'(แพ็กเกจ|package|plan|subscription)[^\w]*(\w+)', txt, re.IGNORECASE)
-            if plan_match:
-                raw_plan = plan_match.group(2)
-        
         plan = translate_plan_name(raw_plan)
 
-        country = find(r'"countryOfSignup"\s*:\s*"([^"]+)"')
-        if country == "Unknown":
-            country = find(r'"countryCode"\s*:\s*"([^"]+)"')
+        # === IMPROVED COUNTRY DETECTION ===
+        
+        # 1. Where account was created (original)
+        signup_country = find(r'"countryOfSignup"\s*:\s*"([^"]+)"')
+        
+        # 2. Current country based on IP/location (BEST - if available)
+        current_country = find(r'"currentCountry"\s*:\s*"([^"]+)"')
+        
+        # 3. Country from membership details
+        membership_country = find(r'"country"\s*:\s*"([^"]+)"')
+        
+        # 4. From locale settings
+        locale = find(r'"locale"\s*:\s*"([^"]+)"')
+        locale_country = locale.split('_')[0].upper() if locale and '_' in locale else None
+        if not locale_country and locale and len(locale) == 2:
+            locale_country = locale.upper()
+        
+        # 5. From currency (backup)
+        currency = find(r'"currency"\s*:\s*"([^"]+)"')
+        currency_map = {
+            'PHP': 'PH', 'USD': 'US', 'EUR': 'EU', 'GBP': 'GB', 'JPY': 'JP',
+            'KRW': 'KR', 'THB': 'TH', 'IDR': 'ID', 'MYR': 'MY', 'SGD': 'SG',
+            'AUD': 'AU', 'CAD': 'CA', 'MXN': 'MX', 'BRL': 'BR', 'ARS': 'AR',
+            'CLP': 'CL', 'COP': 'CO', 'PEN': 'PE', 'CHF': 'CH', 'SEK': 'SE',
+            'NOK': 'NO', 'DKK': 'DK', 'PLN': 'PL', 'CZK': 'CZ', 'HUF': 'HU',
+            'RON': 'RO', 'BGN': 'BG', 'HRK': 'HR', 'TRY': 'TR', 'ILS': 'IL',
+            'AED': 'AE', 'SAR': 'SA', 'ZAR': 'ZA', 'INR': 'IN', 'PKR': 'PK',
+            'BDT': 'BD', 'LKR': 'LK', 'NPR': 'NP', 'MMK': 'MM', 'VND': 'VN',
+            'TWD': 'TW', 'HKD': 'HK', 'CNY': 'CN', 'RUB': 'RU', 'UAH': 'UA',
+            'KZT': 'KZ', 'EGP': 'EG', 'NGN': 'NG', 'KES': 'KE', 'GHS': 'GH'
+        }
+        currency_country = currency_map.get(currency, None)
+        
+        # 6. Detect from page language/content (fallback)
+        detected_country = None
+        txt_lower = txt.lower()
+        
+        # Check for specific language indicators
+        if '"es-ES"' in txt or 'es_ES' in txt or 'España' in txt:
+            detected_country = 'ES'
+        elif '"es-' in txt or 'espanol' in txt_lower or 'español' in txt_lower:
+            detected_country = 'MX'  # Generic Spanish/LATAM
+        elif '"pt-BR"' in txt or 'pt_BR' in txt or 'Brasil' in txt:
+            detected_country = 'BR'
+        elif '"pt-' in txt or 'portugues' in txt_lower:
+            detected_country = 'PT'
+        elif '"fr-FR"' in txt or 'fr_FR' in txt:
+            detected_country = 'FR'
+        elif '"fr-' in txt or 'francais' in txt_lower:
+            detected_country = 'CA'  # or FR
+        elif '"de-DE"' in txt or 'de_DE' in txt:
+            detected_country = 'DE'
+        elif '"de-' in txt or 'deutsch' in txt_lower:
+            detected_country = 'AT'  # or DE/CH
+        elif '"it-IT"' in txt or 'it_IT' in txt:
+            detected_country = 'IT'
+        elif '"ja-JP"' in txt or 'ja_JP' in txt or '日本' in txt:
+            detected_country = 'JP'
+        elif '"ko-KR"' in txt or 'ko_KR' in txt or '한국' in txt:
+            detected_country = 'KR'
+        elif '"th-TH"' in txt or 'th_TH' in txt or 'ไทย' in txt:
+            detected_country = 'TH'
+        elif '"ph-PH"' in txt or 'ph_PH' in txt or 'Pilipinas' in txt:
+            detected_country = 'PH'
+        elif '"id-ID"' in txt or 'id_ID' in txt or 'Indonesia' in txt:
+            detected_country = 'ID'
+        elif '"vi-VN"' in txt or 'vi_VN' in txt or 'Việt Nam' in txt:
+            detected_country = 'VN'
+        elif '"ms-MY"' in txt or 'ms_MY' in txt or 'Malaysia' in txt:
+            detected_country = 'MY'
+        elif '"zh-TW"' in txt or 'zh_TW' in txt or '台灣' in txt:
+            detected_country = 'TW'
+        elif '"zh-HK"' in txt or 'zh_HK' in txt or '香港' in txt:
+            detected_country = 'HK'
+        elif '"zh-CN"' in txt or 'zh_CN' in txt or '中国' in txt:
+            detected_country = 'CN'
+        elif '"tr-TR"' in txt or 'tr_TR' in txt or 'Türkiye' in txt:
+            detected_country = 'TR'
+        elif '"ar-' in txt or 'العربية' in txt:
+            detected_country = 'SA'  # Generic Arabic
+        elif '"pl-PL"' in txt or 'pl_PL' in txt:
+            detected_country = 'PL'
+        elif '"nl-NL"' in txt or 'nl_NL' in txt:
+            detected_country = 'NL'
+        elif '"sv-SE"' in txt or 'sv_SE' in txt:
+            detected_country = 'SE'
+        elif '"en-GB"' in txt or 'en_GB' in txt:
+            detected_country = 'GB'
+        elif '"en-US"' in txt or 'en_US' in txt:
+            detected_country = 'US'
+        elif '"en-' in txt:
+            detected_country = 'US'  # Default English
+        
+        # Priority: current_country > detected from content > membership > signup > locale > currency
+        country = (
+            current_country if current_country != "Unknown" else
+            detected_country if detected_country else
+            membership_country if membership_country != "Unknown" else
+            signup_country if signup_country != "Unknown" else
+            locale_country if locale_country else
+            currency_country if currency_country else
+            "Unknown"
+        )
 
         email = find(r'"emailAddress"\s*:\s*"([^"]+)"')
         if email != "Unknown":
@@ -315,6 +412,7 @@ def check_netflix_cookie(cookie_dict):
         is_valid = bool(status_match)
         is_premium = is_valid and status_match.group(1) == 'CURRENT_MEMBER'
         
+        # Determine subscription type from plan
         subscription_type = "Standard"
         plan_lower = plan.lower()
 
@@ -327,15 +425,15 @@ def check_netflix_cookie(cookie_dict):
         elif "mobile" in plan_lower:
             subscription_type = "Mobile"
         
+        # Additional detection from page content if plan is Unknown
         if plan == "Unknown" and is_premium:
-            txt_lower = txt.lower()
-            if any(indicator in txt_lower for indicator in ['"isUhdAvailable":true', '"uhd":true', '"hdr":true', '"4k":true']):
+            if any(indicator in txt_lower for indicator in ['"isuhdavailable":true', '"uhd":true', '"hdr":true', '"4k":true']):
                 plan = "Premium (UHD)"
                 subscription_type = "Premium"
-            elif any(indicator in txt_lower for indicator in ['"maxStreams":4']):
+            elif '"maxstreams":4' in txt_lower:
                 plan = "Premium (4 screens)"
                 subscription_type = "Premium"
-            elif any(indicator in txt_lower for indicator in ['"maxStreams":2']):
+            elif '"maxstreams":2' in txt_lower:
                 plan = "Standard (2 screens)"
                 subscription_type = "Standard"
 
@@ -343,10 +441,21 @@ def check_netflix_cookie(cookie_dict):
             'ok': is_valid,
             'premium': is_premium,
             'email': email,
-            'country': country,
+            'country': country,           # Best detected current country
+            'signup_country': signup_country if signup_country != "Unknown" else country,  # Where account was created
             'plan': plan,
-            'subscription_type': subscription_type
+            'subscription_type': subscription_type,
+            'detection_method': (
+                'current_ip' if current_country != "Unknown" else
+                'content_language' if detected_country else
+                'membership' if membership_country != "Unknown" else
+                'signup' if signup_country != "Unknown" else
+                'locale' if locale_country else
+                'currency' if currency_country else
+                'unknown'
+            )
         }
+        
     except Exception as e:
         logger.error(f"Error checking cookie: {str(e)}")
         return {'ok': False, 'err': str(e)}
@@ -521,7 +630,7 @@ def check_premium_status(user_id):
         logger.error(f"Error checking premium status: {e}")
         return False  # Fail-safe: assume not premium on error
 
-def store_netflix_account(email, netflix_id, subscription_type, country, plan, cookie_content, user_id):
+def store_netflix_account(email, netflix_id, subscription_type, country, plan, cookie_content, user_id, signup_country=None, detection_method=None):
     try:
         existing = supabase.table('netflix_accounts').select('id').eq('email', email).execute()
         
@@ -529,13 +638,15 @@ def store_netflix_account(email, netflix_id, subscription_type, country, plan, c
             'email': email,
             'netflix_id': netflix_id,
             'subscription_type': subscription_type,
-            'country': country,
+            'country': country,                    # Current detected country
+            'signup_country': signup_country or country,  # Where account was created
             'plan': plan,
             'is_premium': True,
             'cookie_data': cookie_content[:500] if cookie_content else None,
             'added_by': user_id,
             'last_checked': datetime.utcnow().isoformat(),
-            'is_active': True
+            'is_active': True,
+            'detection_method': detection_method   # How we detected the country
         }
         
         if existing.data:
@@ -744,7 +855,9 @@ def check_cookie(user):
                 country=account_info["country"],
                 plan=account_info["plan"],
                 cookie_content=content,
-                user_id=user.id
+                user_id=user.id,
+                signup_country=account_info.get("signup_country"),  # Where created
+                detection_method=account_info.get("detection_method")  # How detected
             )
             if success and db_record:
                 account_db_id = db_record.get('id')

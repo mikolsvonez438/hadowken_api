@@ -632,16 +632,20 @@ def check_premium_status(user_id):
 
 def store_netflix_account(email, netflix_id, subscription_type, country, plan, cookie_content, user_id, signup_country=None, detection_method=None):
     try:
-        headers = {
-            'apikey': SUPABASE_SERVICE_KEY,
-            'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
-            'Content-Type': 'application/json',
-            'Prefer': 'return=representation'
-        }
-        check_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?select=id&email=eq.{urllib.parse.quote(email, safe='')}"
-        check_resp = requests.get(check_url, headers=headers)
-        existing = check_resp.json() if check_resp.status_code == 200 else []
-        #existing = supabase.table('netflix_accounts').select('id').eq('email', email).execute()
+        # CRITICAL: Create fresh options with service role key to bypass RLS
+        from supabase.lib.client_options import ClientOptions
+        
+        options = ClientOptions(
+            headers={
+                'apikey': SUPABASE_SERVICE_KEY,
+                'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}'
+            }
+        )
+        
+        # Create temporary admin client
+        admin_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY, options=options)
+        
+        existing = admin_client.table('netflix_accounts').select('id').eq('email', email).execute()
         
         account_data = {
             'email': email,
@@ -658,25 +662,16 @@ def store_netflix_account(email, netflix_id, subscription_type, country, plan, c
             'detection_method': detection_method
         }
         
-        if existing and len(existing) > 0:
-            account_id = existing[0]['id']
-            update_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?id=eq.{account_id}"
-            resp = requests.patch(update_url, headers=headers, json=account_data)
+        if existing.data:
+            account_id = existing.data[0]['id']
+            result = admin_client.table('netflix_accounts').update(account_data).eq('id', account_id).execute()
         else:
-            insert_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts"
-            resp = requests.post(insert_url, headers=headers, json=account_data)
-        
-        if resp.status_code in [200, 201]:
-            result_data = resp.json()
-            return True, result_data[0] if isinstance(result_data, list) and result_data else None
-        else:
-            logger.error(f"DB Error {resp.status_code}: {resp.text}")
-            return False, None
+            result = admin_client.table('netflix_accounts').insert(account_data).execute()
             
+        return True, result.data[0] if result.data else None
+        
     except Exception as e:
-        logger.error(f"Exception storing account: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+        logger.error(f"Error storing account: {e}")
         return False, None
         
 

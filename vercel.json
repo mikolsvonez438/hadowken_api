@@ -5,5 +5,11 @@
       "src": "/(.*)",
       "dest": "api/index.py"
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/validate-accounts",
+      "schedule": "0 * * * *"
+    }
   ]
 }

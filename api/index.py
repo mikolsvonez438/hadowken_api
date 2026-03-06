@@ -1134,14 +1134,18 @@ def health():
 
 @app.route('/api/cron/validate-accounts', methods=['GET', 'POST'])
 def cron_validate_accounts():
-    # Verify it's from Vercel Cron (optional security)
-    auth_header = request.headers.get('Authorization')
+    # Security check - verify cron secret or Vercel signature
     cron_secret = os.environ.get('CRON_SECRET')
+    auth_header = request.headers.get('Authorization', '')
     
-    if cron_secret and auth_header != f"Bearer {cron_secret}":
-        # Also allow Vercel's internal requests
-        if request.headers.get('User-Agent') != 'Vercel Cron':
-            return jsonify({'status': 'unauthorized'}), 401
+    is_vercel = (
+        request.headers.get('User-Agent') == 'Vercel Cron' or
+        (cron_secret and auth_header == f"Bearer {cron_secret}") or
+        request.headers.get('x-vercel-signature') is not None  # Vercel internal
+    )
+    
+    if not is_vercel and os.environ.get('VERCEL_ENV') == 'production':
+        return jsonify({'status': 'unauthorized'}), 401
     
     try:
         # Get all active premium accounts

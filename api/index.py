@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_from_directory, make_response, stream_with_context, Response
+from flask import Flask, request, jsonify, send_from_directory, make_response, stream_with_context, Response, g
 from flask_cors import CORS, cross_origin
 from functools import wraps
 import os
@@ -14,7 +14,8 @@ import tempfile
 import shutil
 import uuid
 import hashlib
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from supabase import create_client, Client
 from gotrue.errors import AuthApiError
 from dotenv import load_dotenv
@@ -24,9 +25,6 @@ from flask_limiter.util import get_remote_address
 from flask_talisman import Talisman
 import secrets
 from marshmallow import Schema, fields, validate, ValidationError
-from flask import Flask, session
-from datetime import timedelta
-from functools import wraps
 
 load_dotenv()
 urllib3.disable_warnings(InsecureRequestWarning)
@@ -34,15 +32,14 @@ urllib3.disable_warnings(InsecureRequestWarning)
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 
-
+# Vercel-compatible limiter (memory storage acceptable for serverless)
 limiter = Limiter(app=app, key_func=get_remote_address, default_limits=[])
 
-app.config['SESSION_TYPE'] = 'filesystem'  
+app.config['SESSION_TYPE'] = 'filesystem'
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=24)
-app.config['SESSION_COOKIE_SECURE'] = True  # HTTPS only
+app.config['SESSION_COOKIE_SECURE'] = True
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
-
 
 # Production-ready Talisman
 Talisman(app, 
@@ -102,12 +99,15 @@ class CookieCheckSchema(Schema):
     mode = fields.String(validate=validate.OneOf(['check_only', 'generate_token']), 
                         missing='check_only')
 
+# =============================================================================
+# ALL HELPER FUNCTIONS AND DECORATORS (DEFINED BEFORE USE)
+# =============================================================================
+
 def is_super_admin(user_id):
     """Check if user is super admin"""
     if not user_id:
         return False
     
-    # Check environment variable list first
     if str(user_id) in SUPER_ADMIN_IDS:
         logger.info(f"User {user_id} is super admin (env var)")
         return True
@@ -127,13 +127,114 @@ def is_super_admin(user_id):
     except Exception as e:
         logger.error(f"Error checking super admin: {e}")
         return False
-        
+
 def validate_input(data):
     schema = CookieCheckSchema()
     try:
         return schema.load(data), None
     except ValidationError as err:
         return None, err.messages
+
+def require_auth(f):
+    """Decorator to require authentication"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'status': 'error', 'message': 'Authentication required'}), 401
+        
+        token = auth_header.split(' ')[1]
+        try:
+            user = supabase.auth.get_user(token)
+            
+            session = supabase.auth.get_session()
+            if session and session.expires_at:
+                if session.expires_at < time.time() + 300:
+                    new_session = supabase.auth.refresh_session()
+                    if new_session:
+                        g.new_token = new_session.access_token
+            
+            return f(user.user, *args, **kwargs)
+            
+        except Exception as e:
+            logger.error(f"Auth error: {e}")
+            return jsonify({'status': 'error', 'message': 'Invalid or expired token'}), 401
+    
+    return decorated_function
+
+def require_super_admin(f):
+    """Decorator to require super admin access"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'status': 'error', 'message': 'Authentication required'}), 401
+        
+        token = auth_header.split(' ')[1]
+        try:
+            user = supabase.auth.get_user(token)
+            if not user or not is_super_admin(user.user.id):
+                return jsonify({'status': 'error', 'message': 'Super admin access required'}), 403
+            return f(user.user, *args, **kwargs)
+        except Exception as e:
+            logger.error(f"Super admin check error: {e}")
+            return jsonify({'status': 'error', 'message': 'Invalid token'}), 401
+    
+    return decorated_function
+
+def get_accounts_query(user_id, is_premium=False, is_admin=False):
+    """Build query based on user permissions"""
+    if is_admin:
+        return supabase.table('netflix_accounts').select('*')
+    
+    return supabase.table('netflix_accounts')\
+        .select('*')\
+        .eq('is_active', True)\
+        .eq('is_premium', True)\
+        .or_('exclusive_access.eq.false,reserved_for_super_admin.eq.false')
+
+def ensure_ph_accounts_pool():
+    """Ensure at least 8 PH premium accounts exist for super admin"""
+    try:
+        result = supabase.table('netflix_accounts')\
+            .select('*', count='exact')\
+            .eq('country', 'PH')\
+            .eq('is_premium', True)\
+            .eq('is_active', True)\
+            .execute()
+        
+        current_count = result.count if hasattr(result, 'count') else len(result.data or [])
+        
+        if current_count < 8:
+            logger.warning(f"PH accounts pool low: {current_count}/8. Super admin should add more.")
+        
+        return current_count
+    except Exception as e:
+        logger.error(f"Error checking PH accounts pool: {e}")
+        return 0
+
+def check_premium_status(user_id):
+    try:
+        result = supabase.table('user_profiles')\
+            .select('is_premium')\
+            .eq('id', user_id)\
+            .single()\
+            .execute()
+        
+        is_premium = result.data.get('is_premium', False) if result.data else False
+        return is_premium
+        
+    except Exception as e:
+        logger.error(f"Error checking premium status: {e}")
+        return False
+
+def decode_unicode(text):
+    if not text or not isinstance(text, str):
+        return text
+    try:
+        return text.encode('utf-8').decode('unicode-escape')
+    except:
+        return text
 
 def translate_plan_name(plan_name):
     if not plan_name or plan_name == "Unknown":
@@ -185,64 +286,6 @@ def translate_plan_name(plan_name):
         return 'Standard with Ads'
     
     return decoded.title()
-
-PLAN_TRANSLATIONS_FALLBACK = {
-    'พรีเมียม': 'Premium', 'สแตนดาร์ด': 'Standard', 'เบสิก': 'Basic', 'โมบาย': 'Mobile', 'โฆษณา': 'Standard with Ads',
-    'premium': 'Premium', 'estándar': 'Standard', 'padrão': 'Standard', 'básico': 'Basic', 'básica': 'Basic',
-    'móvil': 'Mobile', 'móvel': 'Mobile', 'con anuncios': 'Standard with Ads', 'com anúncios': 'Standard with Ads',
-    'essentiel': 'Basic', 'standard': 'Standard', 'basis': 'Basic', 'werbefrei': 'Standard',
-    'プレミアム': 'Premium', 'スタンダード': 'Standard', 'ベーシック': 'Basic',
-    '프리미엄': 'Premium', '스탠다드': 'Standard', '베이직': 'Basic',
-    '高级': 'Premium', '标准': 'Standard', '基础': 'Basic', '含广告': 'Standard with Ads',
-    'премиум': 'Premium', 'стандарт': 'Standard', 'базовый': 'Basic',
-    'بريميوم': 'Premium', 'ستاندرد': 'Standard', 'أساسي': 'Basic',
-    'temel': 'Basic', 'podstawowy': 'Basic', 'standar': 'Standard', 'dasar': 'Basic',
-    'cao cấp': 'Premium', 'tiêu chuẩn': 'Standard', 'cơ bản': 'Basic',
-}
-
-def translate_plan_name_with_fallback(plan_name):
-    if not plan_name or plan_name == "Unknown":
-        return "Unknown"
-    
-    cleaned = plan_name.strip().lower()
-    
-    if cleaned in PLAN_TRANSLATIONS_FALLBACK:
-        return PLAN_TRANSLATIONS_FALLBACK[cleaned]
-    
-    try:
-        translated = translator.translate(plan_name)
-        if translated:
-            translated_clean = translated.strip().lower()
-            
-            if 'premium' in translated_clean or 'ultra' in translated_clean:
-                return 'Premium'
-            elif 'standard' in translated_clean:
-                return 'Standard'
-            elif 'basic' in translated_clean or 'essential' in translated_clean:
-                return 'Basic'
-            elif 'mobile' in translated_clean:
-                return 'Mobile'
-            elif 'ad' in translated_clean:
-                return 'Standard with Ads'
-            
-            return translated.title()
-    except Exception as e:
-        logger.warning(f"Auto-translation failed, using original: {e}")
-    
-    return plan_name.title()
-
-@app.after_request
-def security_headers(response):
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['X-Frame-Options'] = 'DENY'
-    response.headers['X-XSS-Protection'] = '1; mode=block'
-    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
-    response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
-    return response
-
-@app.route('/api/<path:path>', methods=['OPTIONS'])
-def options_handler(path):
-    return '', 204
 
 def extract_netflix_id(content):
     try:
@@ -318,7 +361,6 @@ def check_netflix_cookie(cookie_dict):
             m = re.search(pattern, txt, flags)
             return m.group(1).strip() if m else "Unknown"
 
-        # === PLAN DETECTION (keep existing) ===
         raw_plan = find(r'"planName"\s*:\s*"([^"]+)"')
         if raw_plan == "Unknown":
             raw_plan = find(r'localizedPlanName[^}]+"value":"([^"]+)"')
@@ -329,24 +371,15 @@ def check_netflix_cookie(cookie_dict):
         
         plan = translate_plan_name(raw_plan)
 
-        # === IMPROVED COUNTRY DETECTION ===
-        
-        # 1. Where account was created (original)
         signup_country = find(r'"countryOfSignup"\s*:\s*"([^"]+)"')
-        
-        # 2. Current country based on IP/location (BEST - if available)
         current_country = find(r'"currentCountry"\s*:\s*"([^"]+)"')
-        
-        # 3. Country from membership details
         membership_country = find(r'"country"\s*:\s*"([^"]+)"')
         
-        # 4. From locale settings
         locale = find(r'"locale"\s*:\s*"([^"]+)"')
         locale_country = locale.split('_')[0].upper() if locale and '_' in locale else None
         if not locale_country and locale and len(locale) == 2:
             locale_country = locale.upper()
         
-        # 5. From currency (backup)
         currency = find(r'"currency"\s*:\s*"([^"]+)"')
         currency_map = {
             'PHP': 'PH', 'USD': 'US', 'EUR': 'EU', 'GBP': 'GB', 'JPY': 'JP',
@@ -362,15 +395,13 @@ def check_netflix_cookie(cookie_dict):
         }
         currency_country = currency_map.get(currency, None)
         
-        # 6. Detect from page language/content (fallback)
         detected_country = None
         txt_lower = txt.lower()
         
-        # Check for specific language indicators
         if '"es-ES"' in txt or 'es_ES' in txt or 'España' in txt:
             detected_country = 'ES'
         elif '"es-' in txt or 'espanol' in txt_lower or 'español' in txt_lower:
-            detected_country = 'MX'  # Generic Spanish/LATAM
+            detected_country = 'MX'
         elif '"pt-BR"' in txt or 'pt_BR' in txt or 'Brasil' in txt:
             detected_country = 'BR'
         elif '"pt-' in txt or 'portugues' in txt_lower:
@@ -378,11 +409,11 @@ def check_netflix_cookie(cookie_dict):
         elif '"fr-FR"' in txt or 'fr_FR' in txt:
             detected_country = 'FR'
         elif '"fr-' in txt or 'francais' in txt_lower:
-            detected_country = 'CA'  # or FR
+            detected_country = 'CA'
         elif '"de-DE"' in txt or 'de_DE' in txt:
             detected_country = 'DE'
         elif '"de-' in txt or 'deutsch' in txt_lower:
-            detected_country = 'AT'  # or DE/CH
+            detected_country = 'AT'
         elif '"it-IT"' in txt or 'it_IT' in txt:
             detected_country = 'IT'
         elif '"ja-JP"' in txt or 'ja_JP' in txt or '日本' in txt:
@@ -408,7 +439,7 @@ def check_netflix_cookie(cookie_dict):
         elif '"tr-TR"' in txt or 'tr_TR' in txt or 'Türkiye' in txt:
             detected_country = 'TR'
         elif '"ar-' in txt or 'العربية' in txt:
-            detected_country = 'SA'  # Generic Arabic
+            detected_country = 'SA'
         elif '"pl-PL"' in txt or 'pl_PL' in txt:
             detected_country = 'PL'
         elif '"nl-NL"' in txt or 'nl_NL' in txt:
@@ -420,9 +451,8 @@ def check_netflix_cookie(cookie_dict):
         elif '"en-US"' in txt or 'en_US' in txt:
             detected_country = 'US'
         elif '"en-' in txt:
-            detected_country = 'US'  # Default English
+            detected_country = 'US'
         
-        # Priority: current_country > detected from content > membership > signup > locale > currency
         country = (
             current_country if current_country != "Unknown" else
             detected_country if detected_country else
@@ -441,7 +471,6 @@ def check_netflix_cookie(cookie_dict):
         is_valid = bool(status_match)
         is_premium = is_valid and status_match.group(1) == 'CURRENT_MEMBER'
         
-        # Determine subscription type from plan
         subscription_type = "Standard"
         plan_lower = plan.lower()
 
@@ -454,7 +483,6 @@ def check_netflix_cookie(cookie_dict):
         elif "mobile" in plan_lower:
             subscription_type = "Mobile"
         
-        # Additional detection from page content if plan is Unknown
         if plan == "Unknown" and is_premium:
             if any(indicator in txt_lower for indicator in ['"isuhdavailable":true', '"uhd":true', '"hdr":true', '"4k":true']):
                 plan = "Premium (UHD)"
@@ -470,8 +498,8 @@ def check_netflix_cookie(cookie_dict):
             'ok': is_valid,
             'premium': is_premium,
             'email': email,
-            'country': country,           # Best detected current country
-            'signup_country': signup_country if signup_country != "Unknown" else country,  # Where account was created
+            'country': country,
+            'signup_country': signup_country if signup_country != "Unknown" else country,
             'plan': plan,
             'subscription_type': subscription_type,
             'detection_method': (
@@ -488,14 +516,6 @@ def check_netflix_cookie(cookie_dict):
     except Exception as e:
         logger.error(f"Error checking cookie: {str(e)}")
         return {'ok': False, 'err': str(e)}
-
-def decode_unicode(text):
-    if not text or not isinstance(text, str):
-        return text
-    try:
-        return text.encode('utf-8').decode('unicode-escape')
-    except:
-        return text
 
 def generate_token(netflix_id):
     url = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
@@ -583,7 +603,6 @@ def generate_token(netflix_id):
 def extract_zip_and_get_files(zip_path, extract_dir):
     txt_files = []
     try:
-        # Use /tmp for Vercel compatibility
         extract_dir = os.path.join(TEMP_DIR, os.path.basename(extract_dir))
         os.makedirs(extract_dir, exist_ok=True)
         
@@ -597,67 +616,6 @@ def extract_zip_and_get_files(zip_path, extract_dir):
     except Exception as e:
         logger.error(f"Error extracting ZIP: {e}")
         return []
-
-def get_user_from_token(auth_header):
-    if not auth_header or not auth_header.startswith('Bearer '):
-        return None
-    
-    token = auth_header.split(' ')[1]
-    try:
-        user = supabase.auth.get_user(token)
-        return user.user if user else None
-    except:
-        return None
-
-def require_auth(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({'status': 'error', 'message': 'Authentication required'}), 401
-        
-        token = auth_header.split(' ')[1]
-        try:
-            # Try to get user - this validates the token
-            user = supabase.auth.get_user(token)
-            
-            # CRITICAL: Check if token needs refresh
-            session = supabase.auth.get_session()
-            if session and session.expires_at:
-                import time
-                if session.expires_at < time.time() + 300:  # Expires in 5 min
-                    # Refresh the token
-                    new_session = supabase.auth.refresh_session()
-                    if new_session:
-                        # Return new token in response header
-                        g.new_token = new_session.access_token
-            
-            return f(user.user, *args, **kwargs)
-            
-        except Exception as e:
-            logger.error(f"Auth error: {e}")
-            return jsonify({'status': 'error', 'message': 'Invalid or expired token'}), 401
-    
-    return decorated_function
-
-def check_premium_status(user_id):
-    try:
-        cache_key = f"premium:{user_id}"
-        
-        result = supabase.table('user_profiles')\
-            .select('is_premium')\
-            .eq('id', user_id)\
-            .single()\
-            .execute()
-        
-        is_premium = result.data.get('is_premium', False) if result.data else False
-        
-        # Cache the result
-        return is_premium
-        
-    except Exception as e:
-        logger.error(f"Error checking premium status: {e}")
-        return False  # Fail-safe: assume not premium on error
 
 def store_netflix_account(email, netflix_id, subscription_type, country, plan, 
                          cookie_content, user_id, signup_country=None, 
@@ -684,7 +642,6 @@ def store_netflix_account(email, netflix_id, subscription_type, country, plan,
             'reserved_for_super_admin': reserved_for_admin if adding_user_is_admin else False
         }
         
-        # Check if account exists using the global client
         existing = supabase.table('netflix_accounts').select('id').eq('email', email).execute()
         
         if existing.data:
@@ -695,7 +652,6 @@ def store_netflix_account(email, netflix_id, subscription_type, country, plan,
             result = supabase.table('netflix_accounts').insert(account_data).execute()
             logger.info(f"Inserted new account: {email}")
             
-        # Verify the result
         if result.data:
             logger.info(f"Store account SUCCESS: {email}, exclusive={account_data['exclusive_access']}")
             return True, result.data[0] if result.data else None
@@ -708,7 +664,6 @@ def store_netflix_account(email, netflix_id, subscription_type, country, plan,
         import traceback
         logger.error(traceback.format_exc())
         return False, None
-        
 
 def log_token_generation(account_id, user_id, ip_address, token=None):
     try:
@@ -744,6 +699,23 @@ def log_token_generation(account_id, user_id, ip_address, token=None):
         import traceback
         logger.error(traceback.format_exc())
         return False
+
+# =============================================================================
+# ROUTES START HERE
+# =============================================================================
+
+@app.after_request
+def security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
+    return response
+
+@app.route('/api/<path:path>', methods=['OPTIONS'])
+def options_handler(path):
+    return '', 204
 
 @app.route('/')
 def serve_index():
@@ -820,12 +792,10 @@ def login():
         
         profile = supabase.table('user_profiles').select('*').eq('id', auth_response.user.id).single().execute()
         
-        # Check if this user should be super admin based on env vars
         is_admin = (email in SUPER_ADMIN_EMAILS or 
                    str(auth_response.user.id) in SUPER_ADMIN_IDS or
                    profile.data.get('is_super_admin', False))
         
-        # Update profile if env var match but DB flag not set
         if is_admin and not profile.data.get('is_super_admin', False):
             supabase.table('user_profiles').update({
                 'is_super_admin': True,
@@ -922,14 +892,12 @@ def check_cookie(user):
         is_premium_user = check_premium_status(user.id)
         is_admin = is_super_admin(user.id)
         
-        # Store account - check if it should be exclusive (PH premium accounts auto-exclusive)
         is_ph_premium = (account_info["country"] == "PH" and 
                         account_info["premium"] and 
                         "Premium" in account_info.get("plan", ""))
         
         account_db_id = None
         if account_info["ok"] and account_info["premium"]:
-            # Only super admins can create exclusive accounts
             can_be_exclusive = is_admin and is_ph_premium
             
             success, db_record = store_netflix_account(
@@ -954,7 +922,6 @@ def check_cookie(user):
                 "message": "Premium subscription required to generate tokens"
             }), 403
         
-        # Rest of your existing code...
         if mode == 'check_only':
             if account_db_id:
                 log_token_generation(
@@ -974,7 +941,7 @@ def check_cookie(user):
                     "subscription_type": account_info["subscription_type"],
                     "mode": "check_only",
                     "stored_in_db": account_info["ok"] and account_info["premium"],
-                    "is_exclusive": is_ph_premium and not is_admin  # Flag if user can't access it later
+                    "is_exclusive": is_ph_premium and not is_admin
                 }
             })
         
@@ -1079,7 +1046,7 @@ def batch_check(user):
             yield f"data: {json.dumps(completion_data)}\n\n"
         
         if request.headers.get('Accept') == 'application/json':
-            for            file in files:
+            for file in files:
                 result = process_single_file(file, mode, is_premium_user, user.id)
                 results.append(result)
             
@@ -1223,19 +1190,15 @@ def get_accounts(user):
                 "message": "Premium subscription required to view accounts"
             }), 403
         
-        # Build query based on permissions
         if is_admin:
-            # Super admin sees everything including exclusive accounts
             query = supabase.table('netflix_accounts').select('*')
         else:
-            # Regular premium users - exclude exclusive/super-admin-only accounts
             query = supabase.table('netflix_accounts')\
                 .select('*')\
                 .eq('is_active', True)\
                 .eq('is_premium', True)\
                 .or_('exclusive_access.eq.false,reserved_for_super_admin.eq.false')
         
-        # Add filters from query params
         country_filter = request.args.get('country')
         if country_filter and not is_admin:
             query = query.eq('country', country_filter)
@@ -1243,12 +1206,10 @@ def get_accounts(user):
         query = query.order('created_at', desc=True)
         accounts = query.execute()
         
-        # Log PH accounts count for monitoring
         if is_admin:
             ph_count = ensure_ph_accounts_pool()
             logger.info(f"Super admin {user.id} accessed accounts. PH pool: {ph_count}")
         
-        # Format response
         safe_accounts = []
         for acc in accounts.data or []:
             account_data = {
@@ -1263,7 +1224,6 @@ def get_accounts(user):
                 'reserved_for_super_admin': acc.get('reserved_for_super_admin', False)
             }
             
-            # Only show exclusive flags to super admin
             if not is_admin:
                 account_data.pop('is_exclusive', None)
                 account_data.pop('reserved_for_super_admin', None)
@@ -1299,7 +1259,6 @@ def get_exclusive_accounts(user):
             .order('created_at', desc=True)\
             .execute()
         
-        # Ensure PH accounts minimum
         ph_accounts = [a for a in (accounts.data or []) if a.get('country') == 'PH']
         other_accounts = [a for a in (accounts.data or []) if a.get('country') != 'PH']
         
@@ -1307,7 +1266,7 @@ def get_exclusive_accounts(user):
             "status": "success",
             "ph_accounts": {
                 "count": len(ph_accounts),
-                "accounts": ph_accounts[:20]  # Limit for performance
+                "accounts": ph_accounts[:20]
             },
             "other_exclusive": other_accounts[:20],
             "ph_minimum_met": len(ph_accounts) >= 8,
@@ -1352,6 +1311,7 @@ def set_account_exclusive(user, account_id):
     except Exception as e:
         logger.error(f"Error setting exclusivity: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
+
 @app.route('/api/accounts/<account_id>/generate-token', methods=['POST', 'OPTIONS'])
 @cross_origin(supports_credentials=True)
 @require_auth
@@ -1432,21 +1392,19 @@ def health():
 
 @app.route('/api/cron/validate-accounts', methods=['GET', 'POST'])
 def cron_validate_accounts():
-    # Security check - verify cron secret or Vercel signature
     cron_secret = os.environ.get('CRON_SECRET')
     auth_header = request.headers.get('Authorization', '')
     
     is_vercel = (
         request.headers.get('User-Agent') == 'Vercel Cron' or
         (cron_secret and auth_header == f"Bearer {cron_secret}") or
-        request.headers.get('x-vercel-signature') is not None  # Vercel internal
+        request.headers.get('x-vercel-signature') is not None
     )
     
     if not is_vercel and os.environ.get('VERCEL_ENV') == 'production':
         return jsonify({'status': 'unauthorized'}), 401
     
     try:
-        # Get all active premium accounts
         accounts = supabase.table('netflix_accounts')\
             .select('*')\
             .eq('is_active', True)\
@@ -1459,18 +1417,14 @@ def cron_validate_accounts():
         
         for account in accounts.data:
             try:
-                # Check if cookie is still valid
                 netflix_id = account.get('netflix_id')
-                cookie_data = account.get('cookie_data', '')
                 
                 if not netflix_id:
                     continue
                 
-                # Reconstruct minimal cookie dict for checking
                 account_info = check_netflix_cookie({"NetflixId": netflix_id})
                 
                 if account_info['ok']:
-                    # Still valid - update last_checked and refresh data
                     update_data = {
                         'last_checked': datetime.utcnow().isoformat(),
                         'plan': account_info['plan'],
@@ -1489,7 +1443,6 @@ def cron_validate_accounts():
                     results['updated'] += 1
                     
                 else:
-                    # Cookie dead - mark as inactive
                     supabase.table('netflix_accounts')\
                         .update({
                             'is_active': False,
@@ -1502,7 +1455,6 @@ def cron_validate_accounts():
                     
                     results['invalid'] += 1
                     
-                # Small delay to avoid rate limiting
                 time.sleep(1)
                 
             except Exception as e:
@@ -1520,57 +1472,6 @@ def cron_validate_accounts():
         logger.error(f"Cron job failed: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-
-def require_super_admin(f):
-    """Decorator to require super admin access"""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({'status': 'error', 'message': 'Authentication required'}), 401
-        
-        token = auth_header.split(' ')[1]
-        try:
-            user = supabase.auth.get_user(token)
-            if not user or not is_super_admin(user.user.id):
-                return jsonify({'status': 'error', 'message': 'Super admin access required'}), 403
-            return f(user.user, *args, **kwargs)
-        except Exception as e:
-            logger.error(f"Super admin check error: {e}")
-            return jsonify({'status': 'error', 'message': 'Invalid token'}), 401
-    
-    return decorated_function
-
-def get_accounts_query(user_id, is_premium=False, is_admin=False):
-    """Build query based on user permissions"""
-    if is_admin:
-        # Super admin sees everything including exclusive accounts
-        return supabase.table('netflix_accounts').select('*')
-    
-    # Regular premium users - exclude exclusive/super-admin-only accounts
-    return supabase.table('netflix_accounts')\
-        .select('*')\
-        .eq('is_active', True)\
-        .eq('is_premium', True)\
-        .or_('exclusive_access.eq.false,reserved_for_super_admin.eq.false')
-def ensure_ph_accounts_pool():
-    """Ensure at least 8 PH premium accounts exist for super admin"""
-    try:
-        # Check current PH accounts count
-        result = supabase.table('netflix_accounts')\
-            .select('*', count='exact')\
-            .eq('country', 'PH')\
-            .eq('is_premium', True)\
-            .eq('is_active', True)\
-            .execute()
-        
-        current_count = result.count if hasattr(result, 'count') else len(result.data or [])
-        
-        if current_count < 8:
-            logger.warning(f"PH accounts pool low: {current_count}/8. Super admin should add more.")
-            # You could trigger notifications here
-        
-        return current_count
-    except Exception as e:
-        logger.error(f"Error checking PH accounts pool: {e}")
-        return 0
+# End of file - no more function definitions after routes
+if __name__ == '__main__':
+    app.run(debug=True)

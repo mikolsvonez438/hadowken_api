@@ -639,18 +639,6 @@ def store_netflix_account(email, netflix_id, subscription_type, country, plan,
                          reserved_for_admin=False):
     """Store account with exclusive access flags"""
     try:
-        from supabase.lib.client_options import ClientOptions
-        
-        options = ClientOptions(
-            headers={
-                'apikey': SUPABASE_SERVICE_KEY,
-                'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}'
-            }
-        )
-        
-        admin_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY, options=options)
-        
-        # Check if super admin is adding this account
         adding_user_is_admin = is_super_admin(user_id)
         
         account_data = {
@@ -670,18 +658,29 @@ def store_netflix_account(email, netflix_id, subscription_type, country, plan,
             'reserved_for_super_admin': reserved_for_admin if adding_user_is_admin else False
         }
         
-        existing = admin_client.table('netflix_accounts').select('id').eq('email', email).execute()
+        # Check if account exists using the global client
+        existing = supabase.table('netflix_accounts').select('id').eq('email', email).execute()
         
         if existing.data:
             account_id = existing.data[0]['id']
-            result = admin_client.table('netflix_accounts').update(account_data).eq('id', account_id).execute()
+            result = supabase.table('netflix_accounts').update(account_data).eq('id', account_id).execute()
+            logger.info(f"Updated existing account: {email}")
         else:
-            result = admin_client.table('netflix_accounts').insert(account_data).execute()
+            result = supabase.table('netflix_accounts').insert(account_data).execute()
+            logger.info(f"Inserted new account: {email}")
             
-        return True, result.data[0] if result.data else None
-        
+        # Verify the result
+        if result.data:
+            logger.info(f"Store account SUCCESS: {email}, exclusive={account_data['exclusive_access']}")
+            return True, result.data[0] if result.data else None
+        else:
+            logger.error(f"Store account returned no data for: {email}")
+            return False, None
+            
     except Exception as e:
         logger.error(f"Error storing account: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return False, None
         
 
@@ -1190,6 +1189,8 @@ def get_accounts(user):
         is_premium = check_premium_status(user.id)
         is_admin = is_super_admin(user.id)
         
+        logger.info(f"User {user.id} accessing accounts. Premium: {is_premium}, Admin: {is_admin}")
+        
         if not is_premium and not is_admin:
             return jsonify({
                 "status": "error",
@@ -1197,7 +1198,16 @@ def get_accounts(user):
             }), 403
         
         # Build query based on permissions
-        query = get_accounts_query(user.id, is_premium, is_admin)
+        if is_admin:
+            # Super admin sees everything including exclusive accounts
+            query = supabase.table('netflix_accounts').select('*')
+        else:
+            # Regular premium users - exclude exclusive/super-admin-only accounts
+            query = supabase.table('netflix_accounts')\
+                .select('*')\
+                .eq('is_active', True)\
+                .eq('is_premium', True)\
+                .or_('exclusive_access.eq.false,reserved_for_super_admin.eq.false')
         
         # Add filters from query params
         country_filter = request.args.get('country')
@@ -1491,6 +1501,7 @@ def is_super_admin(user_id):
     
     # Check environment variable list first
     if str(user_id) in SUPER_ADMIN_IDS:
+        logger.info(f"User {user_id} is super admin (env var)")
         return True
     
     try:
@@ -1501,7 +1512,9 @@ def is_super_admin(user_id):
             .execute()
         
         if result.data:
-            return result.data.get('is_super_admin', False) or result.data.get('role') == 'super_admin'
+            is_admin = result.data.get('is_super_admin', False) or result.data.get('role') == 'super_admin'
+            logger.info(f"User {user_id} super admin check (DB): {is_admin}")
+            return is_admin
         return False
     except Exception as e:
         logger.error(f"Error checking super admin: {e}")
@@ -1529,18 +1542,16 @@ def require_super_admin(f):
 
 def get_accounts_query(user_id, is_premium=False, is_admin=False):
     """Build query based on user permissions"""
-    query = supabase.table('netflix_accounts').select('*')
-    
     if is_admin:
         # Super admin sees everything including exclusive accounts
-        return query
+        return supabase.table('netflix_accounts').select('*')
     
     # Regular premium users - exclude exclusive/super-admin-only accounts
-    query = query.eq('is_active', True).eq('is_premium', True)
-    query = query.or_('exclusive_access.eq.false,reserved_for_super_admin.eq.false')
-    
-    return query
-
+    return supabase.table('netflix_accounts')\
+        .select('*')\
+        .eq('is_active', True)\
+        .eq('is_premium', True)\
+        .or_('exclusive_access.eq.false,reserved_for_super_admin.eq.false')
 def ensure_ph_accounts_pool():
     """Ensure at least 8 PH premium accounts exist for super admin"""
     try:

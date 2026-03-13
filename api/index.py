@@ -102,6 +102,32 @@ class CookieCheckSchema(Schema):
     mode = fields.String(validate=validate.OneOf(['check_only', 'generate_token']), 
                         missing='check_only')
 
+def is_super_admin(user_id):
+    """Check if user is super admin"""
+    if not user_id:
+        return False
+    
+    # Check environment variable list first
+    if str(user_id) in SUPER_ADMIN_IDS:
+        logger.info(f"User {user_id} is super admin (env var)")
+        return True
+    
+    try:
+        result = supabase.table('user_profiles')\
+            .select('is_super_admin, role')\
+            .eq('id', str(user_id))\
+            .single()\
+            .execute()
+        
+        if result.data:
+            is_admin = result.data.get('is_super_admin', False) or result.data.get('role') == 'super_admin'
+            logger.info(f"User {user_id} super admin check (DB): {is_admin}")
+            return is_admin
+        return False
+    except Exception as e:
+        logger.error(f"Error checking super admin: {e}")
+        return False
+        
 def validate_input(data):
     schema = CookieCheckSchema()
     try:
@@ -1494,31 +1520,6 @@ def cron_validate_accounts():
         logger.error(f"Cron job failed: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-def is_super_admin(user_id):
-    """Check if user is super admin"""
-    if not user_id:
-        return False
-    
-    # Check environment variable list first
-    if str(user_id) in SUPER_ADMIN_IDS:
-        logger.info(f"User {user_id} is super admin (env var)")
-        return True
-    
-    try:
-        result = supabase.table('user_profiles')\
-            .select('is_super_admin, role')\
-            .eq('id', str(user_id))\
-            .single()\
-            .execute()
-        
-        if result.data:
-            is_admin = result.data.get('is_super_admin', False) or result.data.get('role') == 'super_admin'
-            logger.info(f"User {user_id} super admin check (DB): {is_admin}")
-            return is_admin
-        return False
-    except Exception as e:
-        logger.error(f"Error checking super admin: {e}")
-        return False
 
 def require_super_admin(f):
     """Decorator to require super admin access"""

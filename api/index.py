@@ -621,7 +621,7 @@ def store_netflix_account(email, netflix_id, subscription_type, country, plan,
                          cookie_content, user_id, signup_country=None, 
                          detection_method=None, is_exclusive=False, 
                          reserved_for_admin=False):
-    """Store account with exclusive access flags using raw REST API to bypass RLS"""
+    """Store account with exclusive access flags"""
     try:
         adding_user_is_admin = is_super_admin(user_id)
         
@@ -642,42 +642,39 @@ def store_netflix_account(email, netflix_id, subscription_type, country, plan,
             'reserved_for_super_admin': reserved_for_admin if adding_user_is_admin else False
         }
         
-        # Use raw REST API with service role key in Authorization header to bypass RLS
+        # Use raw REST API with service role key
         headers = {
             'apikey': SUPABASE_SERVICE_KEY,
-            'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',  # CRITICAL: Service key as Bearer token
+            'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
             'Content-Type': 'application/json',
-            'Prefer': 'return=representation'
+            'Prefer': 'return=representation,resolution=merge-duplicates'  # Added merge-duplicates
         }
         
-        # Check if account exists
+        # Check existing
         check_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?select=id&email=eq.{urllib.parse.quote(email)}"
-        check_resp = requests.get(check_url, headers=headers)
+        check_resp = requests.get(check_url, headers=headers, timeout=30)
         
         if check_resp.status_code == 200 and check_resp.json():
-            # Update existing
+            # Update
             account_id = check_resp.json()[0]['id']
             update_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?id=eq.{account_id}"
-            result = requests.patch(update_url, headers=headers, json=account_data)
+            result = requests.patch(update_url, headers=headers, json=account_data, timeout=30)
             
             if result.status_code in [200, 204]:
-                logger.info(f"Updated existing account: {email}")
-                # Fetch the updated record
-                fetch_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?id=eq.{account_id}"
-                fetch_result = requests.get(fetch_url, headers=headers)
-                if fetch_result.status_code == 200:
-                    return True, fetch_result.json()[0] if fetch_result.json() else None
-                return True, None
+                logger.info(f"Updated account: {email}")
+                # Fetch updated record
+                fetch = requests.get(f"{SUPABASE_URL}/rest/v1/netflix_accounts?id=eq.{account_id}", headers=headers)
+                return True, fetch.json()[0] if fetch.status_code == 200 and fetch.json() else None
             else:
                 logger.error(f"Update failed: {result.status_code} - {result.text}")
                 return False, None
         else:
-            # Insert new
+            # Insert
             insert_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts"
-            result = requests.post(insert_url, headers=headers, json=account_data)
+            result = requests.post(insert_url, headers=headers, json=account_data, timeout=30)
             
             if result.status_code == 201:
-                logger.info(f"Inserted new account: {email}")
+                logger.info(f"Inserted account: {email}")
                 return True, result.json()[0] if result.json() else None
             else:
                 logger.error(f"Insert failed: {result.status_code} - {result.text}")

@@ -61,6 +61,7 @@ ALLOWED_ORIGINS = [
     "http://localhost:5000",
     "http://localhost:8080",
     "https://hakdowken.vercel.app",
+    "https://nftoken.vonezis.me"
 ]
 
 CORS(app, resources={

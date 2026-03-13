@@ -28,17 +28,16 @@ from flask import Flask, session
 from datetime import timedelta
 from functools import wraps
 
-
 load_dotenv()
 urllib3.disable_warnings(InsecureRequestWarning)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 
-# Vercel-compatible limiter (memory storage acceptable for serverless)
+
 limiter = Limiter(app=app, key_func=get_remote_address, default_limits=[])
 
-app.config['SESSION_TYPE'] = 'filesystem'  # or 'redis' for better scalability
+app.config['SESSION_TYPE'] = 'filesystem'  
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=24)
 app.config['SESSION_COOKIE_SECURE'] = True  # HTTPS only
 app.config['SESSION_COOKIE_HTTPONLY'] = True

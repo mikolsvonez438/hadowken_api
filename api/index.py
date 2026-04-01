@@ -924,6 +924,35 @@ def get_current_user(user):
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
 
+@app.route('/api/export/netflix-ids', methods=['GET', 'OPTIONS'])
+@require_super_admin
+def export_netflix_ids(user):
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    try:
+        # Get ALL active netflix_ids
+        result = supabase.table('netflix_accounts')\
+            .select('netflix_id')\
+            .eq('is_active', True)\
+            .execute()
+
+        ids = [acc['netflix_id'] for acc in (result.data or []) if acc.get('netflix_id')]
+
+        if not ids:
+            return jsonify({"status": "error", "message": "No active accounts found"}), 404
+
+        # Create plain text file (one ID per line)
+        txt_content = "\n".join(ids)
+
+        response = Response(txt_content, mimetype='text/plain')
+        response.headers['Content-Disposition'] = 'attachment; filename=netflix_ids_to_recheck.txt'
+        return response
+
+    except Exception as e:
+        logger.error(f"Export error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+        
 @app.route('/api/check', methods=['POST', 'OPTIONS'])
 @cross_origin(supports_credentials=True)
 @require_auth
@@ -1203,7 +1232,7 @@ def process_content(content, filename, mode, is_premium_user, user_id):
             "message": account_info.get('err', 'Invalid account')
         }
     
-    if account_info["ok"] and account_info["premium"]:
+    if account_info["ok"] and account_info.get("premium"):
         store_netflix_account(
             email=account_info["email"],
             netflix_id=netflix_id,
@@ -1211,7 +1240,12 @@ def process_content(content, filename, mode, is_premium_user, user_id):
             country=account_info["country"],
             plan=account_info["plan"],
             cookie_content=content,
-            user_id=user_id
+            user_id=user_id,
+            signup_country=account_info.get("signup_country"),
+            detection_method=account_info.get("detection_method"),
+            next_billing_date=account_info.get("next_billing_date"),
+            days_until_billing=account_info.get("days_until_billing"),
+            is_expired=account_info.get("is_expired", False)
         )
     
     result_data = {

@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify, send_from_directory, make_response, s
 from flask_cors import CORS, cross_origin
 from functools import wraps
 import os
+import io
 import re
 import json
 import requests
@@ -948,22 +949,32 @@ def export_netflix_ids(user):
             all_ids.extend(batch)
 
             if len(batch) < limit:
-                break  # No more records
+                break
 
             offset += limit
 
         if not all_ids:
             return jsonify({"status": "error", "message": "No active accounts found"}), 404
 
-        txt_content = "\n".join(all_ids)
+        # Create ZIP file with one txt per NetflixId
+        memory_file = io.BytesIO()
+        with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for idx, netflix_id in enumerate(all_ids, 1):
+                content = f"NetflixId={netflix_id}\n"
+                filename = f"NetflixId_{idx:04d}.txt"
+                zf.writestr(filename, content)
 
-        response = Response(txt_content, mimetype='text/plain')
-        response.headers['Content-Disposition'] = 'attachment; filename=netflix_ids_to_recheck.txt'
-        response.headers['Content-Length'] = str(len(txt_content))
+        memory_file.seek(0)
+
+        response = Response(memory_file.getvalue(), mimetype='application/zip')
+        response.headers['Content-Disposition'] = 'attachment; filename=netflix_ids_to_recheck.zip'
+        response.headers['Content-Length'] = str(len(memory_file.getvalue()))
         return response
 
     except Exception as e:
-        logger.error(f"Export error: {e}")
+        logger.error(f"Export ZIP error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return jsonify({"status": "error", "message": str(e)}), 500
         
 @app.route('/api/check', methods=['POST', 'OPTIONS'])

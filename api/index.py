@@ -104,29 +104,23 @@ class CookieCheckSchema(Schema):
 # =============================================================================
 
 def is_super_admin(user_id):
-    """Check if user is super admin"""
     if not user_id:
         return False
-    
     if str(user_id) in SUPER_ADMIN_IDS:
-        logger.info(f"User {user_id} is super admin (env var)")
         return True
-    
     try:
         result = supabase.table('user_profiles')\
             .select('is_super_admin, role')\
-            .eq('id', str(user_id))\
-            .single()\
-            .execute()
-        
+            .eq('id', str(user_id)).single().execute()
         if result.data:
-            is_admin = result.data.get('is_super_admin', False) or result.data.get('role') == 'super_admin'
-            logger.info(f"User {user_id} super admin check (DB): {is_admin}")
-            return is_admin
-        return False
+            return result.data.get('is_super_admin') or result.data.get('role') == 'super_admin'
     except Exception as e:
-        logger.error(f"Error checking super admin: {e}")
-        return False
+        logger.error(f"Super admin check error: {e}")
+    return False
+
+class CookieCheckSchema(Schema):
+    content = fields.String(required=True)
+    mode = fields.String(validate=validate.OneOf(['check_only', 'generate_token']), missing='check_only')
 
 def validate_input(data):
     schema = CookieCheckSchema()
@@ -136,31 +130,24 @@ def validate_input(data):
         return None, err.messages
 
 def require_auth(f):
-    """Decorator to require authentication"""
     @wraps(f)
     def decorated_function(*args, **kwargs):
         auth_header = request.headers.get('Authorization')
         if not auth_header or not auth_header.startswith('Bearer '):
             return jsonify({'status': 'error', 'message': 'Authentication required'}), 401
-        
+
         token = auth_header.split(' ')[1]
         try:
-            # Just validate the token
             user_response = supabase.auth.get_user(token)
-            
             if not user_response or not user_response.user:
                 return jsonify({'status': 'error', 'message': 'Invalid token'}), 401
-            
-            # Store user in g for access in route
+
             g.user = user_response.user
             g.token = token
-            
             return f(user_response.user, *args, **kwargs)
-            
         except Exception as e:
             logger.error(f"Auth error: {e}")
             return jsonify({'status': 'error', 'message': 'Invalid or expired token'}), 401
-    
     return decorated_function
 
 @app.after_request
@@ -173,24 +160,21 @@ def add_new_token_header(response):
     return response
 
 def require_super_admin(f):
-    """Decorator to require super admin access"""
     @wraps(f)
-    def decorated_function(*args, **kwargs):
+    def decorated(*args, **kwargs):
         auth_header = request.headers.get('Authorization')
         if not auth_header or not auth_header.startswith('Bearer '):
             return jsonify({'status': 'error', 'message': 'Authentication required'}), 401
-        
         token = auth_header.split(' ')[1]
         try:
-            user = supabase.auth.get_user(token)
-            if not user or not is_super_admin(user.user.id):
-                return jsonify({'status': 'error', 'message': 'Super admin access required'}), 403
-            return f(user.user, *args, **kwargs)
+            user_resp = supabase.auth.get_user(token)
+            if not user_resp or not is_super_admin(user_resp.user.id):
+                return jsonify({'status': 'error', 'message': 'Super admin required'}), 403
+            return f(user_resp.user, *args, **kwargs)
         except Exception as e:
-            logger.error(f"Super admin check error: {e}")
+            logger.error(f"Super admin error: {e}")
             return jsonify({'status': 'error', 'message': 'Invalid token'}), 401
-    
-    return decorated_function
+    return decorated
 
 def get_accounts_query(user_id, is_premium=False, is_admin=False):
     """Build query based on user permissions"""
@@ -739,28 +723,26 @@ def log_token_generation(account_id, user_id, ip_address, token=None):
 def security_headers(response):
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'DENY'
-    response.headers['X-XSS-Protection'] = '1; mode=block'
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
-    response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
     return response
 
-@app.route('/api/<path:path>', methods=['OPTIONS'])
-def options_handler(path):
-    return '', 204
-
 @app.route('/')
-def serve_index():
-    return jsonify({
-        "status": "ok",
-        "message": "Netflix Cookie Checker API is running",
-        "endpoints": {
-            "test": "/api/test",
-            "signup": "/api/auth/signup",
-            "login": "/api/auth/login",
-            "check": "/api/check",
-            "accounts": "/api/accounts"
-        }
-    })
+def home():
+    return jsonify({"status": "ok", "message": "Netflix Cookie Checker API running"})
+
+# @app.route('/')
+# def serve_index():
+#     return jsonify({
+#         "status": "ok",
+#         "message": "Netflix Cookie Checker API is running",
+#         "endpoints": {
+#             "test": "/api/test",
+#             "signup": "/api/auth/signup",
+#             "login": "/api/auth/login",
+#             "check": "/api/check",
+#             "accounts": "/api/accounts"
+#         }
+#     })
 
 @app.route('/api/auth/signup', methods=['POST', 'OPTIONS'])
 @cross_origin(supports_credentials=True)

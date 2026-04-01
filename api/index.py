@@ -136,6 +136,7 @@ def validate_input(data):
         return None, err.messages
 
 def require_auth(f):
+    """Decorator to require authentication"""
     @wraps(f)
     def decorated_function(*args, **kwargs):
         auth_header = request.headers.get('Authorization')
@@ -144,32 +145,17 @@ def require_auth(f):
         
         token = auth_header.split(' ')[1]
         try:
-            # Set session before getting user
-            supabase.auth.set_session(token, refresh_token=None)
-            user = supabase.auth.get_user()
+            # Just validate the token
+            user_response = supabase.auth.get_user(token)
             
-            if not user or not user.user:
+            if not user_response or not user_response.user:
                 return jsonify({'status': 'error', 'message': 'Invalid token'}), 401
             
-            # Check if token is about to expire (within 5 minutes)
-            session = supabase.auth.get_session()
-            if session and session.expires_at:
-                expires_at = session.expires_at
-                current_time = time.time()
-                
-                # If expiring in less than 5 minutes, refresh it
-                if expires_at < current_time + 300:
-                    try:
-                        new_session = supabase.auth.refresh_session()
-                        if new_session:
-                            # Store new token in g for response header
-                            g.new_token = new_session.session.access_token
-                            g.new_refresh_token = new_session.session.refresh_token
-                            g.token_refreshed = True
-                    except Exception as e:
-                        logger.warning(f"Token refresh failed: {e}")
+            # Store user in g for access in route
+            g.user = user_response.user
+            g.token = token
             
-            return f(user.user, *args, **kwargs)
+            return f(user_response.user, *args, **kwargs)
             
         except Exception as e:
             logger.error(f"Auth error: {e}")

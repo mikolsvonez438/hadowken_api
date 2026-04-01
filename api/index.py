@@ -15,7 +15,7 @@ import shutil
 import uuid
 import hashlib
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from supabase import create_client, Client
 from gotrue.errors import AuthApiError
 from dotenv import load_dotenv
@@ -102,19 +102,54 @@ class CookieCheckSchema(Schema):
 # =============================================================================
 # ALL HELPER FUNCTIONS AND DECORATORS (DEFINED BEFORE USE)
 # =============================================================================
-
 def decode_unicode(text):
-    """Properly decode unicode escapes like \x40 → @"""
+    """Decode unicode escapes like \x40 → @ and percent encoding"""
     if not text or not isinstance(text, str):
         return text
     try:
-        # First try unicode-escape (handles \x40, \u0040, etc.)
         decoded = text.encode('utf-8').decode('unicode-escape')
-        # Then handle any remaining percent encoding
         decoded = urllib.parse.unquote(decoded)
         return decoded
     except:
         return text
+
+
+def parse_next_billing_date(date_str):
+    """Parse Netflix next billing date and return (formatted_str, days_left)"""
+    if not date_str or date_str == "Unknown":
+        return None, None
+
+    date_str = date_str.strip()
+    formats = [
+        "%B %d, %Y", "%d %B %Y", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%B %d"
+    ]
+
+    parsed_date = None
+    for fmt in formats:
+        try:
+            if fmt == "%B %d" and len(date_str.split()) == 2:
+                year = datetime.now().year
+                parsed_date = datetime.strptime(f"{date_str} {year}", "%B %d %Y")
+            else:
+                parsed_date = datetime.strptime(date_str, fmt)
+            break
+        except:
+            continue
+
+    if not parsed_date:
+        try:
+            from dateutil import parser
+            parsed_date = parser.parse(date_str, fuzzy=True)
+        except:
+            return date_str, None
+
+    if parsed_date.tzinfo is None:
+        parsed_date = parsed_date.replace(tzinfo=timezone.utc)
+
+    today = datetime.now(timezone.utc)
+    days_left = (parsed_date - today).days
+
+    return date_str, days_left
 
 
 def is_super_admin(user_id):
@@ -136,12 +171,14 @@ class CookieCheckSchema(Schema):
     content = fields.String(required=True)
     mode = fields.String(validate=validate.OneOf(['check_only', 'generate_token']), missing='check_only')
 
+
 def validate_input(data):
     schema = CookieCheckSchema()
     try:
         return schema.load(data), None
     except ValidationError as err:
         return None, err.messages
+
 
 def require_auth(f):
     @wraps(f)
@@ -155,7 +192,6 @@ def require_auth(f):
             user_response = supabase.auth.get_user(token)
             if not user_response or not user_response.user:
                 return jsonify({'status': 'error', 'message': 'Invalid token'}), 401
-
             g.user = user_response.user
             g.token = token
             return f(user_response.user, *args, **kwargs)
@@ -164,14 +200,6 @@ def require_auth(f):
             return jsonify({'status': 'error', 'message': 'Invalid or expired token'}), 401
     return decorated_function
 
-@app.after_request
-def add_new_token_header(response):
-    """Add refreshed token to response headers if available"""
-    if hasattr(g, 'new_token') and g.new_token:
-        response.headers['X-New-Token'] = g.new_token
-        response.headers['X-New-Refresh-Token'] = g.new_refresh_token
-        response.headers['X-Token-Refreshed'] = 'true'
-    return response
 
 def require_super_admin(f):
     @wraps(f)
@@ -224,14 +252,8 @@ def ensure_ph_accounts_pool():
 def check_premium_status(user_id):
     try:
         result = supabase.table('user_profiles')\
-            .select('is_premium')\
-            .eq('id', user_id)\
-            .single()\
-            .execute()
-        
-        is_premium = result.data.get('is_premium', False) if result.data else False
-        return is_premium
-        
+            .select('is_premium').eq('id', user_id).single().execute()
+        return result.data.get('is_premium', False) if result.data else False
     except Exception as e:
         logger.error(f"Error checking premium status: {e}")
         return False
@@ -347,21 +369,21 @@ def extract_netflix_id(content):
 def check_netflix_cookie(cookie_dict):
     session = requests.Session()
     session.cookies.update(cookie_dict)
-    
+
     url = 'https://www.netflix.com/YourAccount'
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
     }
-    
+
     try:
         resp = session.get(url, headers=headers, timeout=30)
         txt = resp.text
-        
+
         if '"mode":"login"' in txt.lower():
             return {'ok': False, 'err': 'Invalid cookie'}
-        
+
         if '"mode":"yourAccount"' not in txt:
             return {'ok': False, 'err': 'Not logged in'}
 
@@ -369,6 +391,7 @@ def check_netflix_cookie(cookie_dict):
             m = re.search(pattern, txt, flags)
             return m.group(1).strip() if m else "Unknown"
 
+        # Plan
         raw_plan = find(r'"planName"\s*:\s*"([^"]+)"')
         if raw_plan == "Unknown":
             raw_plan = find(r'localizedPlanName[^}]+"value":"([^"]+)"')
@@ -376,7 +399,24 @@ def check_netflix_cookie(cookie_dict):
             raw_plan = find(r'"currentPlanName"\s*:\s*"([^"]+)"')
         if raw_plan == "Unknown":
             raw_plan = find(r'"plan"\s*:\s*"([^"]+)"')
-        
+
+        # Next Billing Date (Improved)
+        next_billing_raw = find(r'"nextBillingDate"\s*:\s*"([^"]+)"')
+        if next_billing_raw == "Unknown":
+            next_billing_raw = find(r'data-uia="nextBillingDate-item"[^>]*>([^<]+)<')
+        if next_billing_raw == "Unknown":
+            next_billing_raw = find(r'Next billing date[^:]*[:]\s*([^<"]+)', re.I)
+        if next_billing_raw == "Unknown":
+            next_billing_raw = find(r'next payment[^:]*[:]\s*([^<"]+)', re.I)
+
+        next_billing_str, days_left = parse_next_billing_date(next_billing_raw)
+
+        # Decide if still active
+        is_still_active = True
+        if days_left is not None and days_left < -3:   # small buffer
+            is_still_active = False
+            logger.info(f"Billing expired {days_left} days ago")
+
         plan = translate_plan_name(raw_plan)
 
         signup_country = find(r'"countryOfSignup"\s*:\s*"([^"]+)"')
@@ -503,7 +543,7 @@ def check_netflix_cookie(cookie_dict):
                 subscription_type = "Standard"
 
         return {
-            'ok': is_valid,
+            'ok': is_valid and is_still_active,
             'premium': is_premium,
             'email': email,
             'country': country,
@@ -625,16 +665,22 @@ def extract_zip_and_get_files(zip_path, extract_dir):
         logger.error(f"Error extracting ZIP: {e}")
         return []
 
-def store_netflix_account(email, netflix_id, subscription_type, country, plan, 
-                         cookie_content, user_id, signup_country=None, 
-                         detection_method=None, is_exclusive=False, 
-                         reserved_for_admin=False):
-    """Store account with exclusive access flags"""
+def store_netflix_account(email, netflix_id, subscription_type, country, plan,
+                         cookie_content, user_id, signup_country=None,
+                         detection_method=None, is_exclusive=False,
+                         reserved_for_admin=False, next_billing_date=None,
+                         days_until_billing=None, is_expired=False):
+    """Store account with billing info"""
     try:
         clean_email = decode_unicode(email)
-        
+
+        # Skip clearly expired accounts
+        if is_expired and days_until_billing is not None and days_until_billing < -5:
+            logger.warning(f"Skipping expired account: {clean_email} ({days_until_billing} days)")
+            return False, None
+
         adding_user_is_admin = is_super_admin(user_id)
-        
+
         account_data = {
             'email': clean_email,
             'netflix_id': netflix_id,
@@ -649,47 +695,37 @@ def store_netflix_account(email, netflix_id, subscription_type, country, plan,
             'is_active': True,
             'detection_method': detection_method,
             'exclusive_access': is_exclusive if adding_user_is_admin else False,
-            'reserved_for_super_admin': reserved_for_admin if adding_user_is_admin else False
+            'reserved_for_super_admin': reserved_for_admin if adding_user_is_admin else False,
+            'next_billing_date': next_billing_date,
+            'days_until_billing': days_until_billing,
+            'is_expired': is_expired
         }
-        
-        # Use raw REST API with service role key
+
         headers = {
             'apikey': SUPABASE_SERVICE_KEY,
             'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
             'Content-Type': 'application/json',
-            'Prefer': 'return=representation,resolution=merge-duplicates'  # Added merge-duplicates
+            'Prefer': 'return=representation,resolution=merge-duplicates'
         }
-        
-        # Check existing
-        check_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?select=id&email=eq.{urllib.parse.quote(email)}"
+
+        check_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?select=id&email=eq.{urllib.parse.quote(clean_email)}"
         check_resp = requests.get(check_url, headers=headers, timeout=30)
-        
+
         if check_resp.status_code == 200 and check_resp.json():
-            # Update
             account_id = check_resp.json()[0]['id']
             update_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?id=eq.{account_id}"
             result = requests.patch(update_url, headers=headers, json=account_data, timeout=30)
-            
             if result.status_code in [200, 204]:
-                logger.info(f"Updated account: {email}")
-                # Fetch updated record
                 fetch = requests.get(f"{SUPABASE_URL}/rest/v1/netflix_accounts?id=eq.{account_id}", headers=headers)
-                return True, fetch.json()[0] if fetch.status_code == 200 and fetch.json() else None
-            else:
-                logger.error(f"Update failed: {result.status_code} - {result.text}")
-                return False, None
+                return True, fetch.json()[0] if fetch.status_code == 200 else None
         else:
-            # Insert
             insert_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts"
             result = requests.post(insert_url, headers=headers, json=account_data, timeout=30)
-            
             if result.status_code == 201:
-                logger.info(f"Inserted account: {email}")
                 return True, result.json()[0] if result.json() else None
-            else:
-                logger.error(f"Insert failed: {result.status_code} - {result.text}")
-                return False, None
-            
+
+        return False, None
+
     except Exception as e:
         logger.error(f"Error storing account: {e}")
         import traceback
@@ -939,8 +975,11 @@ def check_cookie(user):
                 user_id=user.id,
                 signup_country=account_info.get("signup_country"),
                 detection_method=account_info.get("detection_method"),
-                is_exclusive=can_be_exclusive,
-                reserved_for_admin=can_be_exclusive
+                is_exclusive=can_be_exclusive if 'can_be_exclusive' in locals() else False,
+                reserved_for_admin=can_be_exclusive if 'can_be_exclusive' in locals() else False,
+                next_billing_date=account_info.get('next_billing_date'),
+                days_until_billing=account_info.get('days_until_billing'),
+                is_expired=account_info.get('is_expired', False)
             )
             if success and db_record:
                 account_db_id = db_record.get('id')

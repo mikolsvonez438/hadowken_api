@@ -136,7 +136,6 @@ def validate_input(data):
         return None, err.messages
 
 def require_auth(f):
-    """Decorator to require authentication"""
     @wraps(f)
     def decorated_function(*args, **kwargs):
         auth_header = request.headers.get('Authorization')
@@ -145,14 +144,30 @@ def require_auth(f):
         
         token = auth_header.split(' ')[1]
         try:
-            user = supabase.auth.get_user(token)
+            # Set session before getting user
+            supabase.auth.set_session(token, refresh_token=None)
+            user = supabase.auth.get_user()
             
+            if not user or not user.user:
+                return jsonify({'status': 'error', 'message': 'Invalid token'}), 401
+            
+            # Check if token is about to expire (within 5 minutes)
             session = supabase.auth.get_session()
             if session and session.expires_at:
-                if session.expires_at < time.time() + 300:
-                    new_session = supabase.auth.refresh_session()
-                    if new_session:
-                        g.new_token = new_session.access_token
+                expires_at = session.expires_at
+                current_time = time.time()
+                
+                # If expiring in less than 5 minutes, refresh it
+                if expires_at < current_time + 300:
+                    try:
+                        new_session = supabase.auth.refresh_session()
+                        if new_session:
+                            # Store new token in g for response header
+                            g.new_token = new_session.session.access_token
+                            g.new_refresh_token = new_session.session.refresh_token
+                            g.token_refreshed = True
+                    except Exception as e:
+                        logger.warning(f"Token refresh failed: {e}")
             
             return f(user.user, *args, **kwargs)
             
@@ -161,6 +176,15 @@ def require_auth(f):
             return jsonify({'status': 'error', 'message': 'Invalid or expired token'}), 401
     
     return decorated_function
+
+@app.after_request
+def add_new_token_header(response):
+    """Add refreshed token to response headers if available"""
+    if hasattr(g, 'new_token') and g.new_token:
+        response.headers['X-New-Token'] = g.new_token
+        response.headers['X-New-Refresh-Token'] = g.new_refresh_token
+        response.headers['X-Token-Refreshed'] = 'true'
+    return response
 
 def require_super_admin(f):
     """Decorator to require super admin access"""

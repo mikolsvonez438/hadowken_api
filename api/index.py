@@ -925,6 +925,7 @@ def get_current_user(user):
         return jsonify({'status': 'error', 'message': str(e)})
 
 @app.route('/api/export/netflix-ids', methods=['GET', 'OPTIONS'])
+@cross_origin(supports_credentials=True)
 @require_super_admin
 def export_netflix_ids(user):
     if request.method == 'OPTIONS':

@@ -103,6 +103,20 @@ class CookieCheckSchema(Schema):
 # ALL HELPER FUNCTIONS AND DECORATORS (DEFINED BEFORE USE)
 # =============================================================================
 
+def decode_unicode(text):
+    """Properly decode unicode escapes like \x40 → @"""
+    if not text or not isinstance(text, str):
+        return text
+    try:
+        # First try unicode-escape (handles \x40, \u0040, etc.)
+        decoded = text.encode('utf-8').decode('unicode-escape')
+        # Then handle any remaining percent encoding
+        decoded = urllib.parse.unquote(decoded)
+        return decoded
+    except:
+        return text
+
+
 def is_super_admin(user_id):
     if not user_id:
         return False
@@ -617,10 +631,12 @@ def store_netflix_account(email, netflix_id, subscription_type, country, plan,
                          reserved_for_admin=False):
     """Store account with exclusive access flags"""
     try:
+        clean_email = decode_unicode(email)
+        
         adding_user_is_admin = is_super_admin(user_id)
         
         account_data = {
-            'email': email,
+            'email': clean_email,
             'netflix_id': netflix_id,
             'subscription_type': subscription_type,
             'country': country,

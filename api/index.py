@@ -932,22 +932,34 @@ def export_netflix_ids(user):
         return '', 204
 
     try:
-        # Get ALL active netflix_ids
-        result = supabase.table('netflix_accounts')\
-            .select('netflix_id')\
-            .eq('is_active', True)\
-            .execute()
+        all_ids = []
+        limit = 1000
+        offset = 0
 
-        ids = [acc['netflix_id'] for acc in (result.data or []) if acc.get('netflix_id')]
+        while True:
+            result = supabase.table('netflix_accounts')\
+                .select('netflix_id')\
+                .eq('is_active', True)\
+                .limit(limit)\
+                .offset(offset)\
+                .execute()
 
-        if not ids:
+            batch = [acc['netflix_id'] for acc in (result.data or []) if acc.get('netflix_id')]
+            all_ids.extend(batch)
+
+            if len(batch) < limit:
+                break  # No more records
+
+            offset += limit
+
+        if not all_ids:
             return jsonify({"status": "error", "message": "No active accounts found"}), 404
 
-        # Create plain text file (one ID per line)
-        txt_content = "\n".join(ids)
+        txt_content = "\n".join(all_ids)
 
         response = Response(txt_content, mimetype='text/plain')
         response.headers['Content-Disposition'] = 'attachment; filename=netflix_ids_to_recheck.txt'
+        response.headers['Content-Length'] = str(len(txt_content))
         return response
 
     except Exception as e:

@@ -1318,10 +1318,7 @@ def get_accounts(user):
                 "message": "Premium subscription required to view accounts"
             }), 403
         
-        if is_admin:
-            query = supabase.table('netflix_accounts').select('*')
-        else:
-            query = supabase.table('netflix_accounts')\
+        query = supabase.table('netflix_accounts')\
                 .select('*')\
                 .eq('is_active', True)\
                 .eq('is_premium', True)\

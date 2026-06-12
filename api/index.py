@@ -1604,13 +1604,11 @@ def cron_validate_accounts():
 @cross_origin(supports_credentials=True)
 @require_super_admin
 def bulk_recheck_accounts(user):
-    """Manually trigger bulk recheck of all accounts with streaming progress"""
     if request.method == 'OPTIONS':
         return '', 204
 
     def generate_progress():
         try:
-            # Fetch all active accounts
             accounts = supabase.table('netflix_accounts')\
                 .select('*')\
                 .eq('is_active', True)\
@@ -1619,21 +1617,26 @@ def bulk_recheck_accounts(user):
             total = len(accounts.data) if accounts.data else 0
             
             if total == 0:
-                yield f"data: {json.dumps({'type': 'complete', 'message': 'No active accounts to check', 'checked': 0, 'valid': 0, 'invalid': 0, 'removed': 0})}\n\n"
+                yield f"data: {json.dumps({'type': 'complete', 'message': 'No active accounts', 'checked': 0, 'valid': 0, 'invalid': 0, 'removed': 0})}\n\n"
                 return
 
             valid_count = 0
             invalid_count = 0
             removed_count = 0
             errors = []
+            last_heartbeat = time.time()
 
             for index, account in enumerate(accounts.data, 1):
                 try:
+                    # Send heartbeat every 5 seconds to keep connection alive
+                    if time.time() - last_heartbeat > 5:
+                        yield f"data: {json.dumps({'type': 'heartbeat', 'time': int(time.time())})}\n\n"
+                        last_heartbeat = time.time()
+
                     netflix_id = account.get('netflix_id')
                     if not netflix_id:
                         continue
 
-                    # Check cookie
                     account_info = check_netflix_cookie({"NetflixId": netflix_id})
                     
                     progress_data = {
@@ -1647,7 +1650,6 @@ def bulk_recheck_accounts(user):
                     yield f"data: {json.dumps(progress_data)}\n\n"
 
                     if account_info['ok']:
-                        # Update account with fresh data
                         update_data = {
                             'last_checked': datetime.utcnow().isoformat(),
                             'plan': account_info['plan'],
@@ -1677,17 +1679,26 @@ def bulk_recheck_accounts(user):
                         yield f"data: {json.dumps(result_data)}\n\n"
                         
                     else:
-                        # Mark as inactive (soft delete)
-                        supabase.table('netflix_accounts')\
-                            .update({
-                                'is_active': False,
-                                'last_checked': datetime.utcnow().isoformat(),
-                                'deactivated_reason': account_info.get('err', 'Invalid cookie'),
-                                'deactivated_at': datetime.utcnow().isoformat(),
-                                'is_expired': True
-                            })\
-                            .eq('id', account['id'])\
-                            .execute()
+                        # FIX: Don't use deactivated_at if column doesn't exist
+                        update_data = {
+                            'is_active': False,
+                            'last_checked': datetime.utcnow().isoformat(),
+                            'deactivated_reason': account_info.get('err', 'Invalid cookie'),
+                            'is_expired': True
+                        }
+                        
+                        # Only add deactivated_at if column exists
+                        try:
+                            supabase.table('netflix_accounts')\
+                                .update({**update_data, 'deactivated_at': datetime.utcnow().isoformat()})\
+                                .eq('id', account['id'])\
+                                .execute()
+                        except Exception as col_err:
+                            # Column doesn't exist, update without it
+                            supabase.table('netflix_accounts')\
+                                .update(update_data)\
+                                .eq('id', account['id'])\
+                                .execute()
                         
                         invalid_count += 1
                         removed_count += 1
@@ -1700,7 +1711,6 @@ def bulk_recheck_accounts(user):
                         }
                         yield f"data: {json.dumps(result_data)}\n\n"
 
-                    # Rate limiting - be nice to Netflix
                     time.sleep(1.5)
 
                 except Exception as e:
@@ -1711,12 +1721,11 @@ def bulk_recheck_accounts(user):
                         'type': 'result',
                         'email': account.get('email'),
                         'status': 'error',
-                        'reason': str(e)
+                        'reason': str(e)[:100]
                     }
                     yield f"data: {json.dumps(error_data)}\n\n"
                     continue
 
-            # Final summary
             completion_data = {
                 'type': 'complete',
                 'checked': total,
@@ -1737,10 +1746,10 @@ def bulk_recheck_accounts(user):
         mimetype='text/event-stream',
         headers={
             'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no'
+            'X-Accel-Buffering': 'no',
+            'Connection': 'keep-alive'
         }
     )
-
 
 @app.route('/api/admin/account-stats', methods=['GET', 'OPTIONS'])
 @cross_origin(supports_credentials=True)
@@ -1783,13 +1792,13 @@ def get_account_stats(user):
             .execute()
         premium_count = premium_result.count if hasattr(premium_result, 'count') else len(premium_result.data or [])
 
-        # Last checked stats
-        old_accounts = supabase.table('netflix_accounts')\
+        # Last checked stats (accounts not checked in 7 days)
+        old_result = supabase.table('netflix_accounts')\
             .select('*', count='exact')\
             .lt('last_checked', (datetime.utcnow() - timedelta(days=7)).isoformat())\
             .eq('is_active', True)\
             .execute()
-        needs_recheck = old_result.count if hasattr(old_accounts, 'count') else len(old_accounts.data or [])
+        needs_recheck = old_result.count if hasattr(old_result, 'count') else len(old_result.data or [])
 
         return jsonify({
             'status': 'success',
@@ -1806,7 +1815,10 @@ def get_account_stats(user):
 
     except Exception as e:
         logger.error(f"Stats error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
 # End of file - no more function definitions after routes
 if __name__ == '__main__':
     app.run(debug=True)

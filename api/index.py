@@ -1302,41 +1302,65 @@ def process_content(content, filename, mode, is_premium_user, user_id):
 @require_auth
 def get_accounts(user):
     if request.method == 'OPTIONS':
-        response = make_response()
-        response.headers.add('Access-Control-Max-Age', '86400')
-        return response, 204
+        return '', 204
         
     try:
         is_premium = check_premium_status(user.id)
         is_admin = is_super_admin(user.id)
         
-        logger.info(f"User {user.id} accessing accounts. Premium: {is_premium}, Admin: {is_admin}")
-        
         if not is_premium and not is_admin:
             return jsonify({
                 "status": "error",
-                "message": "Premium subscription required to view accounts"
+                "message": "Premium subscription required"
             }), 403
         
-        query = supabase.table('netflix_accounts')\
-                .select('*')\
-                .eq('is_active', True)\
-                .eq('is_premium', True)\
-                .or_('exclusive_access.eq.false,reserved_for_super_admin.eq.false')
+        headers = {
+            'apikey': SUPABASE_SERVICE_KEY,
+            'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
+            'Content-Type': 'application/json'
+        }
+        
+        # Build query parameters
+        params = {
+            'select': '*',
+            'order': 'created_at.desc'
+        }
+        
+        if not is_admin:
+            # Premium users: filter active, non-expired, non-exclusive
+            params['is_active'] = 'eq.true'
+            params['is_premium'] = 'eq.true'
+            params['is_expired'] = 'eq.false'
+            # For exclusive_access and reserved_for_super_admin, we handle in code
         
         country_filter = request.args.get('country')
         if country_filter and not is_admin:
-            query = query.eq('country', country_filter)
+            params['country'] = f'eq.{country_filter}'
         
-        query = query.order('created_at', desc=True)
-        accounts = query.execute()
+        # Fetch accounts
+        fetch_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts"
+        fetch_resp = requests.get(fetch_url, headers=headers, params=params, timeout=30)
         
-        if is_admin:
-            ph_count = ensure_ph_accounts_pool()
-            logger.info(f"Super admin {user.id} accessed accounts. PH pool: {ph_count}")
+        if fetch_resp.status_code != 200:
+            return jsonify({"status": "error", "message": f"Fetch failed: {fetch_resp.status_code}"}), 500
+        
+        all_accounts = fetch_resp.json()
         
         safe_accounts = []
-        for acc in accounts.data or []:
+        for acc in all_accounts:
+            days_left = acc.get('days_until_billing')
+            is_expired = acc.get('is_expired', False)
+            is_exclusive = acc.get('exclusive_access', False)
+            is_reserved = acc.get('reserved_for_super_admin', False)
+            
+            # Skip expired for non-admins
+            if not is_admin and (is_expired or (days_left is not None and days_left < -3)):
+                continue
+            
+            # Skip exclusive/reserved for non-admins
+            if not is_admin and (is_exclusive or is_reserved):
+                continue
+            
             account_data = {
                 'id': acc['id'],
                 'email': acc['email'],
@@ -1345,13 +1369,14 @@ def get_accounts(user):
                 'plan': acc['plan'],
                 'created_at': acc['created_at'],
                 'last_checked': acc['last_checked'],
-                'is_exclusive': acc.get('exclusive_access', False),
-                'reserved_for_super_admin': acc.get('reserved_for_super_admin', False)
+                'days_until_billing': days_left,
+                'next_billing_date': acc.get('next_billing_date'),
+                'is_expired': is_expired
             }
             
-            if not is_admin:
-                account_data.pop('is_exclusive', None)
-                account_data.pop('reserved_for_super_admin', None)
+            if is_admin:
+                account_data['is_exclusive'] = is_exclusive
+                account_data['reserved_for_super_admin'] = is_reserved
             
             safe_accounts.append(account_data)
         

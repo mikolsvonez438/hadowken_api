@@ -1620,132 +1620,144 @@ def cron_validate_accounts():
 @cross_origin(supports_credentials=True)
 @require_super_admin
 def bulk_recheck_accounts(user):
-    """Manually trigger bulk recheck of all accounts with streaming progress"""
+    """Process accounts in chunks like batch-check, return JSON (not SSE)"""
     if request.method == 'OPTIONS':
         return '', 204
 
-    def generate_progress():
-        try:
-            headers = {
-                'apikey': SUPABASE_SERVICE_KEY,
-                'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
-                'Content-Type': 'application/json',
-                'Prefer': 'return=minimal'  # Don't return data, faster
-            }
-            
-            # Fetch all active accounts
-            fetch_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?select=*&is_active=eq.true&order=created_at.desc"
-            fetch_resp = requests.get(fetch_url, headers=headers, timeout=30)
-            
-            if fetch_resp.status_code != 200:
-                yield f"data: {json.dumps({'type': 'error', 'message': f'Failed to fetch accounts: {fetch_resp.status_code}'})}\n\n"
-                return
-            
-            accounts = fetch_resp.json()
-            total = len(accounts)
-            
-            if total == 0:
-                yield f"data: {json.dumps({'type': 'complete', 'message': 'No active accounts to check', 'checked': 0, 'valid': 0, 'invalid': 0, 'removed': 0})}\n\n"
-                return
-
-            valid_count = 0
-            invalid_count = 0
-            removed_count = 0
-            errors = []
-            last_heartbeat = time.time()
-
-            for index, account in enumerate(accounts, 1):
-                try:
-                    # Heartbeat every 3 seconds
-                    if time.time() - last_heartbeat > 3:
-                        yield f"data: {json.dumps({'type': 'heartbeat', 'time': int(time.time())})}\n\n"
-                        last_heartbeat = time.time()
-
-                    netflix_id = account.get('netflix_id')
-                    email = account.get('email', 'Unknown')
-                    
-                    if not netflix_id:
-                        continue
-
-                    # Progress BEFORE checking
-                    yield f"data: {json.dumps({'type': 'progress', 'current': index, 'total': total, 'email': email, 'percent': int((index / total) * 100), 'status': 'checking'})}\n\n"
-
-                    # Check cookie
-                    account_info = check_netflix_cookie({"NetflixId": netflix_id})
-                    
-                    if account_info['ok']:
-                        # Update valid account
-                        update_data = {
-                            'last_checked': datetime.utcnow().isoformat(),
-                            'plan': account_info['plan'],
-                            'subscription_type': account_info['subscription_type'],
-                            'country': account_info['country'],
-                            'is_active': True,
-                            'is_premium': account_info['premium'],
-                            'next_billing_date': account_info.get('next_billing_date'),
-                            'days_until_billing': account_info.get('days_until_billing'),
-                            'is_expired': False,
-                            'deactivated_reason': None,  # Clear any old reason
-                            'deactivated_at': None       # Clear any old deactivation
-                        }
-                        
-                        update_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?id=eq.{account['id']}"
-                        update_resp = requests.patch(update_url, headers=headers, json=update_data, timeout=30)
-                        
-                        if update_resp.status_code in [200, 204]:
-                            valid_count += 1
-                            yield f"data: {json.dumps({'type': 'result', 'email': email, 'status': 'valid', 'plan': account_info['plan'], 'country': account_info['country']})}\n\n"
-                        else:
-                            raise Exception(f"Update failed: {update_resp.status_code} - {update_resp.text[:200]}")
-                        
-                    else:
-                        # Mark as inactive - these columns now exist in your schema
-                        update_data = {
-                            'is_active': False,
-                            'last_checked': datetime.utcnow().isoformat(),
-                            'deactivated_reason': account_info.get('err', 'Invalid cookie'),
-                            'deactivated_at': datetime.utcnow().isoformat(),
-                            'is_expired': True
-                        }
-                        
-                        update_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?id=eq.{account['id']}"
-                        update_resp = requests.patch(update_url, headers=headers, json=update_data, timeout=30)
-                        
-                        if update_resp.status_code not in [200, 204]:
-                            raise Exception(f"Deactivate failed: {update_resp.status_code}")
-                        
-                        invalid_count += 1
-                        removed_count += 1
-                        
-                        yield f"data: {json.dumps({'type': 'result', 'email': email, 'status': 'invalid', 'reason': account_info.get('err', 'Invalid')})}\n\n"
-
-                    time.sleep(1.5)
-
-                except Exception as e:
-                    error_msg = str(e)
-                    errors.append({'account_id': account.get('id'), 'error': error_msg})
-                    logger.error(f"Error checking account {account.get('id')}: {e}")
-                    yield f"data: {json.dumps({'type': 'result', 'email': account.get('email', 'Unknown'), 'status': 'error', 'reason': error_msg[:200]})}\n\n"
+    try:
+        headers = {
+            'apikey': SUPABASE_SERVICE_KEY,
+            'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
+            'Content-Type': 'application/json',
+            'Prefer': 'return=minimal'
+        }
+        
+        # Get chunk parameters from request (frontend sends chunks of ~15)
+        data = request.get_json() or {}
+        chunk_size = data.get('chunk_size', 15)
+        offset = data.get('offset', 0)
+        
+        # Fetch accounts with pagination
+        fetch_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?select=*&is_active=eq.true&order=created_at.desc&limit={chunk_size}&offset={offset}"
+        fetch_resp = requests.get(fetch_url, headers=headers, timeout=30)
+        
+        if fetch_resp.status_code != 200:
+            return jsonify({'status': 'error', 'message': f'Failed to fetch: {fetch_resp.status_code}'}), 500
+        
+        accounts = fetch_resp.json()
+        
+        if not accounts:
+            return jsonify({
+                'status': 'complete',
+                'message': 'No more accounts to process',
+                'chunk': [],
+                'offset': offset,
+                'has_more': False
+            })
+        
+        results = []
+        valid_count = 0
+        invalid_count = 0
+        
+        for account in accounts:
+            try:
+                netflix_id = account.get('netflix_id')
+                email = account.get('email', 'Unknown')
+                
+                if not netflix_id:
+                    results.append({
+                        'email': email,
+                        'status': 'error',
+                        'reason': 'Missing NetflixId'
+                    })
                     continue
 
-            # Final summary
-            yield f"data: {json.dumps({'type': 'complete', 'checked': total, 'valid': valid_count, 'invalid': invalid_count, 'removed': removed_count, 'errors': len(errors), 'message': f'Recheck complete. {valid_count} valid, {invalid_count} invalid (removed), {len(errors)} errors.'})}\n\n"
+                # Check cookie (same as batch check)
+                account_info = check_netflix_cookie({"NetflixId": netflix_id})
+                
+                if account_info['ok']:
+                    # Update valid account
+                    update_data = {
+                        'last_checked': datetime.utcnow().isoformat(),
+                        'plan': account_info['plan'],
+                        'subscription_type': account_info['subscription_type'],
+                        'country': account_info['country'],
+                        'is_active': True,
+                        'is_premium': account_info['premium'],
+                        'next_billing_date': account_info.get('next_billing_date'),
+                        'days_until_billing': account_info.get('days_until_billing'),
+                        'is_expired': False,
+                        'deactivated_reason': None,
+                        'deactivated_at': None
+                    }
+                    
+                    update_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?id=eq.{account['id']}"
+                    requests.patch(update_url, headers=headers, json=update_data, timeout=30)
+                    
+                    valid_count += 1
+                    results.append({
+                        'email': email,
+                        'status': 'valid',
+                        'plan': account_info['plan'],
+                        'country': account_info['country']
+                    })
+                    
+                else:
+                    # Mark as inactive
+                    update_data = {
+                        'is_active': False,
+                        'last_checked': datetime.utcnow().isoformat(),
+                        'deactivated_reason': account_info.get('err', 'Invalid cookie'),
+                        'deactivated_at': datetime.utcnow().isoformat(),
+                        'is_expired': True
+                    }
+                    
+                    update_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?id=eq.{account['id']}"
+                    requests.patch(update_url, headers=headers, json=update_data, timeout=30)
+                    
+                    invalid_count += 1
+                    results.append({
+                        'email': email,
+                        'status': 'invalid',
+                        'reason': account_info.get('err', 'Invalid cookie')
+                    })
 
-        except Exception as e:
-            logger.error(f"Bulk recheck failed: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+                # Rate limiting - same as batch check
+                time.sleep(1.5)
 
-    return Response(
-        stream_with_context(generate_progress()),
-        mimetype='text/event-stream',
-        headers={
-            'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no',
-            'Connection': 'keep-alive'
-        }
-    )
+            except Exception as e:
+                logger.error(f"Error checking account {account.get('id')}: {e}")
+                results.append({
+                    'email': account.get('email', 'Unknown'),
+                    'status': 'error',
+                    'reason': str(e)[:200]
+                })
+                continue
+
+        # Check if there are more accounts
+        next_offset = offset + len(accounts)
+        count_resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/netflix_accounts?select=*&is_active=eq.true&limit=1&offset={next_offset}",
+            headers=headers, timeout=30
+        )
+        has_more = len(count_resp.json()) > 0 if count_resp.status_code == 200 else False
+
+        return jsonify({
+            'status': 'success',
+            'chunk': results,
+            'offset': offset,
+            'next_offset': next_offset,
+            'has_more': has_more,
+            'chunk_valid': valid_count,
+            'chunk_invalid': invalid_count,
+            'message': f'Processed {len(results)} accounts. {valid_count} valid, {invalid_count} invalid.'
+        })
+
+    except Exception as e:
+        logger.error(f"Bulk recheck failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/api/admin/account-stats', methods=['GET', 'OPTIONS'])
 @cross_origin(supports_credentials=True)

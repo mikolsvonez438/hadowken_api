@@ -413,10 +413,9 @@ def check_netflix_cookie(cookie_dict):
         next_billing_str, days_left = parse_next_billing_date(next_billing_raw)
 
         # Decide if still active
-        is_still_active = True
-        if days_left is not None and days_left < -3:   # small buffer
-            is_still_active = False
-            logger.info(f"Billing expired {days_left} days ago")
+        is_expired = False
+        if days_left is not None and days_left < -3:
+            is_expired = True
 
         plan = translate_plan_name(raw_plan)
 
@@ -544,7 +543,7 @@ def check_netflix_cookie(cookie_dict):
                 subscription_type = "Standard"
 
         return {
-            'ok': is_valid and is_still_active,
+            'ok': is_valid and not is_expired,
             'premium': is_premium,
             'email': email,
             'country': country,
@@ -559,7 +558,10 @@ def check_netflix_cookie(cookie_dict):
                 'locale' if locale_country else
                 'currency' if currency_country else
                 'unknown'
-            )
+            ),
+            'next_billing_date': next_billing_str,
+            'days_until_billing': days_left,
+            'is_expired': is_expired
         }
         
     except Exception as e:
@@ -1598,6 +1600,213 @@ def cron_validate_accounts():
         logger.error(f"Cron job failed: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
+@app.route('/api/admin/bulk-recheck', methods=['POST', 'OPTIONS'])
+@cross_origin(supports_credentials=True)
+@require_super_admin
+def bulk_recheck_accounts(user):
+    """Manually trigger bulk recheck of all accounts with streaming progress"""
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    def generate_progress():
+        try:
+            # Fetch all active accounts
+            accounts = supabase.table('netflix_accounts')\
+                .select('*')\
+                .eq('is_active', True)\
+                .execute()
+
+            total = len(accounts.data) if accounts.data else 0
+            
+            if total == 0:
+                yield f"data: {json.dumps({'type': 'complete', 'message': 'No active accounts to check', 'checked': 0, 'valid': 0, 'invalid': 0, 'removed': 0})}\n\n"
+                return
+
+            valid_count = 0
+            invalid_count = 0
+            removed_count = 0
+            errors = []
+
+            for index, account in enumerate(accounts.data, 1):
+                try:
+                    netflix_id = account.get('netflix_id')
+                    if not netflix_id:
+                        continue
+
+                    # Check cookie
+                    account_info = check_netflix_cookie({"NetflixId": netflix_id})
+                    
+                    progress_data = {
+                        'type': 'progress',
+                        'current': index,
+                        'total': total,
+                        'email': account.get('email', 'Unknown'),
+                        'percent': int((index / total) * 100),
+                        'status': 'checking'
+                    }
+                    yield f"data: {json.dumps(progress_data)}\n\n"
+
+                    if account_info['ok']:
+                        # Update account with fresh data
+                        update_data = {
+                            'last_checked': datetime.utcnow().isoformat(),
+                            'plan': account_info['plan'],
+                            'subscription_type': account_info['subscription_type'],
+                            'country': account_info['country'],
+                            'is_active': True,
+                            'is_premium': account_info['premium'],
+                            'next_billing_date': account_info.get('next_billing_date'),
+                            'days_until_billing': account_info.get('days_until_billing'),
+                            'is_expired': False
+                        }
+                        
+                        supabase.table('netflix_accounts')\
+                            .update(update_data)\
+                            .eq('id', account['id'])\
+                            .execute()
+                        
+                        valid_count += 1
+                        
+                        result_data = {
+                            'type': 'result',
+                            'email': account.get('email'),
+                            'status': 'valid',
+                            'plan': account_info['plan'],
+                            'country': account_info['country']
+                        }
+                        yield f"data: {json.dumps(result_data)}\n\n"
+                        
+                    else:
+                        # Mark as inactive (soft delete)
+                        supabase.table('netflix_accounts')\
+                            .update({
+                                'is_active': False,
+                                'last_checked': datetime.utcnow().isoformat(),
+                                'deactivated_reason': account_info.get('err', 'Invalid cookie'),
+                                'deactivated_at': datetime.utcnow().isoformat(),
+                                'is_expired': True
+                            })\
+                            .eq('id', account['id'])\
+                            .execute()
+                        
+                        invalid_count += 1
+                        removed_count += 1
+                        
+                        result_data = {
+                            'type': 'result',
+                            'email': account.get('email'),
+                            'status': 'invalid',
+                            'reason': account_info.get('err', 'Invalid')
+                        }
+                        yield f"data: {json.dumps(result_data)}\n\n"
+
+                    # Rate limiting - be nice to Netflix
+                    time.sleep(1.5)
+
+                except Exception as e:
+                    errors.append({'account_id': account['id'], 'error': str(e)})
+                    logger.error(f"Error checking account {account['id']}: {e}")
+                    
+                    error_data = {
+                        'type': 'result',
+                        'email': account.get('email'),
+                        'status': 'error',
+                        'reason': str(e)
+                    }
+                    yield f"data: {json.dumps(error_data)}\n\n"
+                    continue
+
+            # Final summary
+            completion_data = {
+                'type': 'complete',
+                'checked': total,
+                'valid': valid_count,
+                'invalid': invalid_count,
+                'removed': removed_count,
+                'errors': len(errors),
+                'message': f'Recheck complete. {valid_count} valid, {invalid_count} invalid (removed), {len(errors)} errors.'
+            }
+            yield f"data: {json.dumps(completion_data)}\n\n"
+
+        except Exception as e:
+            logger.error(f"Bulk recheck failed: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return Response(
+        stream_with_context(generate_progress()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no'
+        }
+    )
+
+
+@app.route('/api/admin/account-stats', methods=['GET', 'OPTIONS'])
+@cross_origin(supports_credentials=True)
+@require_super_admin
+def get_account_stats(user):
+    """Get quick stats for super admin dashboard"""
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    try:
+        # Total accounts
+        total_result = supabase.table('netflix_accounts')\
+            .select('*', count='exact')\
+            .execute()
+        total = total_result.count if hasattr(total_result, 'count') else len(total_result.data or [])
+
+        # Active accounts
+        active_result = supabase.table('netflix_accounts')\
+            .select('*', count='exact')\
+            .eq('is_active', True)\
+            .execute()
+        active = active_result.count if hasattr(active_result, 'count') else len(active_result.data or [])
+
+        # Expired/Inactive
+        inactive = total - active
+
+        # PH accounts
+        ph_result = supabase.table('netflix_accounts')\
+            .select('*', count='exact')\
+            .eq('country', 'PH')\
+            .eq('is_active', True)\
+            .execute()
+        ph_count = ph_result.count if hasattr(ph_result, 'count') else len(ph_result.data or [])
+
+        # Premium accounts
+        premium_result = supabase.table('netflix_accounts')\
+            .select('*', count='exact')\
+            .eq('is_premium', True)\
+            .eq('is_active', True)\
+            .execute()
+        premium_count = premium_result.count if hasattr(premium_result, 'count') else len(premium_result.data or [])
+
+        # Last checked stats
+        old_accounts = supabase.table('netflix_accounts')\
+            .select('*', count='exact')\
+            .lt('last_checked', (datetime.utcnow() - timedelta(days=7)).isoformat())\
+            .eq('is_active', True)\
+            .execute()
+        needs_recheck = old_result.count if hasattr(old_accounts, 'count') else len(old_accounts.data or [])
+
+        return jsonify({
+            'status': 'success',
+            'stats': {
+                'total': total,
+                'active': active,
+                'inactive': inactive,
+                'ph_accounts': ph_count,
+                'premium_accounts': premium_count,
+                'needs_recheck': needs_recheck,
+                'last_updated': datetime.utcnow().isoformat()
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"Stats error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 # End of file - no more function definitions after routes
 if __name__ == '__main__':
     app.run(debug=True)

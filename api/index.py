@@ -1318,25 +1318,17 @@ def get_accounts(user):
                 "message": "Premium subscription required to view accounts"
             }), 403
         
-        # Build query based on user permissions
-        if is_admin:
-            query = supabase.table('netflix_accounts').select('*')
-        else:
-            # Premium users: only active, non-expired, non-exclusive accounts
-            query = supabase.table('netflix_accounts')\
-                .select('*')\
-                .eq('is_active', True)\
-                .eq('is_premium', True)\
-                .or_('exclusive_access.eq.false,reserved_for_super_admin.eq.false')
-        
-        # CRITICAL FIX: Exclude expired accounts for non-admin users
-        # Also exclude accounts with negative days_until_billing (expired)
-        if not is_admin:
-            query = query.eq('is_expired', False)\
-                         .or_('days_until_billing.is.null,days_until_billing.gte.0')
+        # SAME FILTER FOR EVERYONE: only active, premium, non-expired accounts
+        query = supabase.table('netflix_accounts')\
+            .select('*')\
+            .eq('is_active', True)\
+            .eq('is_premium', True)\
+            .eq('is_expired', False)\
+            .or_('days_until_billing.is.null,days_until_billing.gte.0')\
+            .or_('exclusive_access.eq.false,reserved_for_super_admin.eq.false')
         
         country_filter = request.args.get('country')
-        if country_filter and not is_admin:
+        if country_filter:
             query = query.eq('country', country_filter)
         
         query = query.order('created_at', desc=True)
@@ -1348,13 +1340,10 @@ def get_accounts(user):
         
         safe_accounts = []
         for acc in accounts.data or []:
-            # Additional server-side filtering for expired accounts
-            # Skip if expired (negative days or flagged)
+            # Extra safety: skip anything that slipped through with negative billing
             days_left = acc.get('days_until_billing')
-            is_expired = acc.get('is_expired', False)
-            
-            if not is_admin and (is_expired or (days_left is not None and days_left < -3)):
-                continue  # Skip expired accounts for premium users
+            if days_left is not None and days_left < -3:
+                continue
             
             account_data = {
                 'id': acc['id'],
@@ -1364,16 +1353,16 @@ def get_accounts(user):
                 'plan': acc['plan'],
                 'created_at': acc['created_at'],
                 'last_checked': acc['last_checked'],
-                'is_exclusive': acc.get('exclusive_access', False),
-                'reserved_for_super_admin': acc.get('reserved_for_super_admin', False),
                 'days_until_billing': days_left,
-                'next_billing_date': acc.get('next_billing_date'),
-                'is_expired': is_expired
+                'next_billing_date': acc.get('next_billing_date')
             }
             
-            if not is_admin:
-                account_data.pop('is_exclusive', None)
-                account_data.pop('reserved_for_super_admin', None)
+            # Admins see extra metadata (but same filtered accounts)
+            if is_admin:
+                account_data['is_exclusive'] = acc.get('exclusive_access', False)
+                account_data['reserved_for_super_admin'] = acc.get('reserved_for_super_admin', False)
+                account_data['is_expired'] = acc.get('is_expired', False)
+                account_data['added_by'] = acc.get('added_by')
             
             safe_accounts.append(account_data)
         
@@ -1389,7 +1378,7 @@ def get_accounts(user):
         import traceback
         logger.error(traceback.format_exc())
         return jsonify({"status": "error", "message": str(e)})
-        
+
 @app.route('/api/accounts/exclusive', methods=['GET', 'OPTIONS'])
 @cross_origin(supports_credentials=True)
 @require_super_admin

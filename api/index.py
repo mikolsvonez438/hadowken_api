@@ -27,6 +27,7 @@ from flask_talisman import Talisman
 import secrets
 from marshmallow import Schema, fields, validate, ValidationError
 
+
 load_dotenv()
 urllib3.disable_warnings(InsecureRequestWarning)
 

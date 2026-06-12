@@ -27,7 +27,6 @@ from flask_talisman import Talisman
 import secrets
 from marshmallow import Schema, fields, validate, ValidationError
 
-
 load_dotenv()
 urllib3.disable_warnings(InsecureRequestWarning)
 
@@ -1325,8 +1324,6 @@ def get_accounts(user):
             .eq('is_active', True)\
             .eq('is_premium', True)\
             .eq('is_expired', False)\
-            .or_('days_until_billing.is.null,days_until_billing.gte.0')\
-            .or_('exclusive_access.eq.false,reserved_for_super_admin.eq.false')
         
         country_filter = request.args.get('country')
         if country_filter:

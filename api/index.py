@@ -381,12 +381,31 @@ def check_netflix_cookie(cookie_dict):
     try:
         resp = session.get(url, headers=headers, timeout=30)
         txt = resp.text
+        txt_lower = txt.lower()
 
-        if '"mode":"login"' in txt.lower():
+        # Check 1: Redirected to login page = invalid cookie
+        if '"mode":"login"' in txt_lower:
             return {'ok': False, 'err': 'Invalid cookie'}
 
+        # Check 2: Not on account page = not logged in
         if '"mode":"yourAccount"' not in txt:
+            # Additional check: is it a payment/billing issue?
+            if 'payment' in txt_lower or 'billing' in txt_lower or 'update your payment' in txt_lower:
+                return {'ok': False, 'err': 'Payment required'}
+            if 'membership has been canceled' in txt_lower or 'canceled' in txt_lower:
+                return {'ok': False, 'err': 'Membership canceled'}
+            if 'restart' in txt_lower and 'membership' in txt_lower:
+                return {'ok': False, 'err': 'Membership expired - restart required'}
+            if 'unauthorized' in txt_lower or 'session expired' in txt_lower:
+                return {'ok': False, 'err': 'Session expired'}
             return {'ok': False, 'err': 'Not logged in'}
+
+        # Check 3: Account page loaded but check for specific expired states
+        if 'your membership is on hold' in txt_lower or 'on hold' in txt_lower:
+            return {'ok': False, 'err': 'Membership on hold'}
+        
+        if 'please update your payment method' in txt_lower or 'payment method' in txt_lower:
+            return {'ok': False, 'err': 'Payment method required'}
 
         def find(pattern, flags=0):
             m = re.search(pattern, txt, flags)
@@ -412,10 +431,31 @@ def check_netflix_cookie(cookie_dict):
 
         next_billing_str, days_left = parse_next_billing_date(next_billing_raw)
 
-        # Decide if still active
+        # Check 4: Billing expired
         is_expired = False
         if days_left is not None and days_left < -3:
             is_expired = True
+
+        # Check 5: Membership status
+        status_match = re.search(r'"membershipStatus":\s*"([^"]+)"', txt)
+        is_valid = bool(status_match)
+        is_premium = is_valid and status_match.group(1) == 'CURRENT_MEMBER'
+        
+        # Check 6: If membershipStatus is not CURRENT_MEMBER, it's invalid
+        if status_match and status_match.group(1) != 'CURRENT_MEMBER':
+            status = status_match.group(1)
+            if status == 'CANCELLED':
+                return {'ok': False, 'err': 'Membership cancelled'}
+            elif status == 'INACTIVE':
+                return {'ok': False, 'err': 'Membership inactive'}
+            elif status == 'HOLD':
+                return {'ok': False, 'err': 'Membership on hold'}
+            else:
+                return {'ok': False, 'err': f'Membership status: {status}'}
+
+        # Check 7: If no membership status found at all, likely not a valid member
+        if not is_valid:
+            return {'ok': False, 'err': 'No membership status found'}
 
         plan = translate_plan_name(raw_plan)
 
@@ -444,7 +484,6 @@ def check_netflix_cookie(cookie_dict):
         currency_country = currency_map.get(currency, None)
         
         detected_country = None
-        txt_lower = txt.lower()
         
         if '"es-ES"' in txt or 'es_ES' in txt or 'España' in txt:
             detected_country = 'ES'
@@ -515,10 +554,6 @@ def check_netflix_cookie(cookie_dict):
         if email != "Unknown":
             email = urllib.parse.unquote(email)
 
-        status_match = re.search(r'"membershipStatus":\s*"([^"]+)"', txt)
-        is_valid = bool(status_match)
-        is_premium = is_valid and status_match.group(1) == 'CURRENT_MEMBER'
-        
         subscription_type = "Standard"
         plan_lower = plan.lower()
 
@@ -543,7 +578,7 @@ def check_netflix_cookie(cookie_dict):
                 subscription_type = "Standard"
 
         return {
-            'ok': is_valid and not is_expired,
+            'ok': is_valid and is_premium and not is_expired,
             'premium': is_premium,
             'email': email,
             'country': country,
@@ -1546,7 +1581,6 @@ def cron_validate_accounts():
             'Prefer': 'return=minimal'
         }
         
-        # Fetch active accounts using REST API
         fetch_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?select=*&is_active=eq.true"
         fetch_resp = requests.get(fetch_url, headers=headers, timeout=30)
         
@@ -1568,7 +1602,20 @@ def cron_validate_accounts():
                 
                 account_info = check_netflix_cookie({"NetflixId": netflix_id})
                 
-                if account_info['ok']:
+                # CRITICAL FIX: Same validation logic as bulk recheck
+                is_valid = account_info.get('ok', False)
+                error_reason = account_info.get('err', 'Unknown error')
+                
+                # Safety checks
+                if is_valid and (not account_info.get('email') or account_info.get('email') == 'Unknown'):
+                    is_valid = False
+                    error_reason = 'Incomplete account data'
+                
+                if is_valid and account_info.get('plan') == 'Unknown' and not account_info.get('premium', False):
+                    is_valid = False
+                    error_reason = 'Unknown plan, likely expired'
+                
+                if is_valid:
                     update_data = {
                         'last_checked': datetime.utcnow().isoformat(),
                         'plan': account_info['plan'],
@@ -1593,9 +1640,10 @@ def cron_validate_accounts():
                     update_data = {
                         'is_active': False,
                         'last_checked': datetime.utcnow().isoformat(),
-                        'deactivated_reason': account_info.get('err', 'Invalid cookie'),
+                        'deactivated_reason': error_reason,
                         'deactivated_at': datetime.utcnow().isoformat(),
-                        'is_expired': True
+                        'is_expired': True,
+                        'is_premium': False
                     }
                     
                     update_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?id=eq.{account['id']}"
@@ -1638,12 +1686,10 @@ def bulk_recheck_accounts(user):
             'Prefer': 'return=minimal'
         }
         
-        # Get chunk parameters from request (frontend sends chunks of ~15)
         data = request.get_json() or {}
         chunk_size = data.get('chunk_size', 15)
         offset = data.get('offset', 0)
         
-        # Fetch accounts with pagination
         fetch_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?select=*&is_active=eq.true&order=created_at.desc&limit={chunk_size}&offset={offset}"
         fetch_resp = requests.get(fetch_url, headers=headers, timeout=30)
         
@@ -1678,10 +1724,25 @@ def bulk_recheck_accounts(user):
                     })
                     continue
 
-                # Check cookie (same as batch check)
+                # Check cookie
                 account_info = check_netflix_cookie({"NetflixId": netflix_id})
                 
-                if account_info['ok']:
+                # CRITICAL FIX: Check both 'ok' AND 'err' keys
+                # 'ok' can be False with 'err' explaining why
+                is_valid = account_info.get('ok', False)
+                error_reason = account_info.get('err', 'Unknown error')
+                
+                # Additional safety: if ok is True but no email/plan, something is wrong
+                if is_valid and (not account_info.get('email') or account_info.get('email') == 'Unknown'):
+                    is_valid = False
+                    error_reason = 'Incomplete account data (missing email)'
+                
+                # Additional safety: if ok is True but plan is Unknown and not premium, likely expired
+                if is_valid and account_info.get('plan') == 'Unknown' and not account_info.get('premium', False):
+                    is_valid = False
+                    error_reason = 'Unknown plan, likely expired or invalid'
+                
+                if is_valid:
                     # Update valid account
                     update_data = {
                         'last_checked': datetime.utcnow().isoformat(),
@@ -1709,13 +1770,14 @@ def bulk_recheck_accounts(user):
                     })
                     
                 else:
-                    # Mark as inactive
+                    # Mark as inactive - use the error reason from check_netflix_cookie
                     update_data = {
                         'is_active': False,
                         'last_checked': datetime.utcnow().isoformat(),
-                        'deactivated_reason': account_info.get('err', 'Invalid cookie'),
+                        'deactivated_reason': error_reason,
                         'deactivated_at': datetime.utcnow().isoformat(),
-                        'is_expired': True
+                        'is_expired': True,
+                        'is_premium': False
                     }
                     
                     update_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?id=eq.{account['id']}"
@@ -1725,10 +1787,9 @@ def bulk_recheck_accounts(user):
                     results.append({
                         'email': email,
                         'status': 'invalid',
-                        'reason': account_info.get('err', 'Invalid cookie')
+                        'reason': error_reason
                     })
 
-                # Rate limiting - same as batch check
                 time.sleep(1.5)
 
             except Exception as e:
@@ -1740,7 +1801,6 @@ def bulk_recheck_accounts(user):
                 })
                 continue
 
-        # Check if there are more accounts
         next_offset = offset + len(accounts)
         count_resp = requests.get(
             f"{SUPABASE_URL}/rest/v1/netflix_accounts?select=*&is_active=eq.true&limit=1&offset={next_offset}",

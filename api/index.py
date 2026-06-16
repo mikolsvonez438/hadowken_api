@@ -27,6 +27,8 @@ from flask_talisman import Talisman
 import secrets
 from marshmallow import Schema, fields, validate, ValidationError
 from bs4 import BeautifulSoup
+import random
+import string
 
 load_dotenv()
 urllib3.disable_warnings(InsecureRequestWarning)
@@ -2436,6 +2438,271 @@ def validate_netflix_cookie_quick(netflix_id):
         return False, {'err': f'Network error: {str(e)}'}
     except Exception as e:
         return False, {'err': f'Validation error: {str(e)}'}
+
+def generate_dynamic_esn():
+    """Generate a random ESN that looks like a real device"""
+    models = [
+        ("IPHONE14-2", "d73ap"),  # iPhone 14 Pro
+        ("IPHONE14-3", "d74ap"),  # iPhone 14 Pro Max
+        ("IPHONE15-1", "d83ap"),  # iPhone 15
+        ("IPHONE15-2", "d84ap"),  # iPhone 15 Pro
+        ("IPHONE13-1", "d17ap"),  # iPhone 13 Pro
+    ]
+    model, board = random.choice(models)
+    
+    # Generate random serial-like string
+    serial = ''.join(random.choices(string.ascii_uppercase + string.digits, k=20))
+    
+    esn = f"NFAPPL-02-{model}%3D1-PXA-{serial}"
+    return esn, model, board
+
+def generate_guid():
+    """Generate a random Netflix GUID"""
+    parts = [
+        ''.join(random.choices(string.ascii_uppercase + string.digits, k=8)),
+        ''.join(random.choices(string.ascii_uppercase + string.digits, k=4)),
+        ''.join(random.choices(string.ascii_uppercase + string.digits, k=4)),
+        ''.join(random.choices(string.ascii_uppercase + string.digits, k=4)),
+        ''.join(random.choices(string.ascii_uppercase + string.digits, k=12)),
+    ]
+    return '-'.join(parts)
+
+def generate_token_improved(netflix_id, secure_netflix_id=None):
+    """
+    IMPROVED token generation with dynamic device params.
+    Falls back to direct nftoken link if generation fails.
+    """
+    esn, model, board = generate_dynamic_esn()
+    guid = generate_guid()
+    
+    # Randomize app version slightly
+    versions = ["17.12.0", "17.11.2", "17.10.1", "16.50.0", "16.45.2"]
+    app_version = random.choice(versions)
+    ios_versions = ["17.4.1", "17.3.1", "17.2.1", "16.7.2", "16.6.1"]
+    ios_version = random.choice(ios_versions)
+    
+    url = f"https://ios.prod.ftl.netflix.com/iosui/user/{app_version.split('.')[0]}.{app_version.split('.')[1]}"
+    
+    config = {
+        "gamesInTrailersEnabled": "false",
+        "isTrailersEvidenceEnabled": "false",
+        "cdsMyListSortEnabled": "true",
+        "kidsBillboardEnabled": "true",
+        "addHorizontalBoxArtToVideoSummariesEnabled": "false",
+        "skOverlayTestEnabled": "false",
+        "homeFeedTestTVMovieListsEnabled": "false",
+        "baselineOnIpadEnabled": "true",
+        "trailersVideoIdLoggingFixEnabled": "true",
+        "postPlayPreviewsEnabled": "false",
+        "bypassContextualAssetsEnabled": "false",
+        "roarEnabled": "false",
+        "useSeason1AltLabelEnabled": "false",
+        "disableCDSSearchPaginationSectionKinds": ["searchVideoCarousel"],
+        "cdsSearchHorizontalPaginationEnabled": "true",
+        "searchPreQueryGamesEnabled": "true",
+        "kidsMyListEnabled": "true",
+        "billboardEnabled": "true",
+        "useCDSGalleryEnabled": "true",
+        "contentWarningEnabled": "true",
+        "videosInPopularGamesEnabled": "true",
+        "avifFormatEnabled": "false",
+        "sharksEnabled": "true"
+    }
+    
+    params = {
+        'appVersion': app_version,
+        'config': json.dumps(config),
+        'device_type': "NFAPPL-02-",
+        'esn': esn,
+        'idiom': "phone",
+        'iosVersion': ios_version,
+        'isTablet': "false",
+        'languages': "en-US",
+        'locale': "en-US",
+        'maxDeviceWidth': "390",
+        'model': board,
+        'modelType': model,
+        'odpAware': "true",
+        'path': '["account","token","default"]',
+        'pathFormat': "graph",
+        'pixelDensity': "3.0",
+        'progressive': "false",
+        'responseFormat': "json"
+    }
+
+    headers = {
+        'User-Agent': f"Argo/{app_version} (iPhone; iOS {ios_version}; Scale/3.00)",
+        'x-netflix.request.attempt': "1",
+        'x-netflix.request.client.user.guid': guid,
+        'x-netflix.context.profile-guid': guid,
+        'x-netflix.request.routing': '{"path":"/nq/mobile/nqios/~' + app_version + '/user","control_tag":"iosui_argo"}',
+        'x-netflix.context.app-version': app_version,
+        'x-netflix.argo.translated': "true",
+        'x-netflix.context.form-factor': "phone",
+        'x-netflix.context.sdk-version': "2024.1",
+        'x-netflix.client.appversion': app_version,
+        'x-netflix.context.max-device-width': "390",
+        'x-netflix.context.ab-tests': "",
+        'x-netflix.tracing.cl.useractionid': generate_guid(),
+        'x-netflix.client.type': "argo",
+        'x-netflix.client.ftl.esn': urllib.parse.unquote(esn),
+        'x-netflix.context.locales': "en-US",
+        'x-netflix.context.top-level-uuid': generate_guid(),
+        'x-netflix.client.iosversion': ios_version,
+        'accept-language': "en-US;q=1",
+        'x-netflix.argo.abtests': "",
+        'x-netflix.context.os-version': ios_version,
+        'x-netflix.request.client.context': '{"appState":"foreground"}',
+        'x-netflix.context.ui-flavor': "argo",
+        'x-netflix.argo.nfnsm': str(random.randint(5, 15)),
+        'x-netflix.context.pixel-density': "3.0",
+        'x-netflix.request.toplevel.uuid': generate_guid(),
+        'x-netflix.request.client.timezoneid': random.choice([
+            "Asia/Manila", "Asia/Singapore", "Asia/Tokyo", 
+            "America/New_York", "Europe/London", "Australia/Sydney"
+        ]),
+        'Cookie': f"NetflixId={netflix_id}" + (f"; SecureNetflixId={secure_netflix_id}" if secure_netflix_id else "")
+    }
+
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=30, verify=False)
+        
+        if response.status_code != 200:
+            logger.error(f"Token generation failed: HTTP {response.status_code}")
+            logger.error(f"Response: {response.text[:500]}")
+            return None
+            
+        data = response.json()
+        
+        if "value" in data and data["value"] and "account" in data["value"]:
+            token_data = data["value"]["account"]["token"]["default"]
+            token = token_data["token"]
+            expires = token_data["expires"]
+            
+            if len(str(expires)) == 13:
+                expires //= 1000
+            
+            return {
+                "status": "Success",
+                "token": token,
+                "expires": expires,
+                "login_urls": {
+                    "phone": f"https://netflix.com/unsupported?nftoken={token}",
+                    "tv": f"https://netflix.com/tv8?nftoken={token}",
+                    "pc": f"https://netflix.com/browse?nftoken={token}"
+                }
+            }
+            
+        logger.error(f"Token generation: No token in response. Keys: {list(data.keys())}")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Token generation error: {str(e)}")
+        return None
+
+@app.route('/api/tv-login-link', methods=['POST', 'OPTIONS'])
+@cross_origin(supports_credentials=True)
+@require_auth
+def generate_tv_login_link(user):
+    """
+    Generate a direct TV login link using nftoken.
+    User opens this link on their phone/PC while on the same network as the TV,
+    and Netflix will link the TV automatically.
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    try:
+        data = request.get_json()
+        account_id = data.get('account_id')
+        custom_netflix_id = data.get('netflix_id', '').strip()
+
+        netflix_id = None
+        
+        # Case 1: Use specific account from DB
+        if account_id:
+            account = supabase.table('netflix_accounts')\
+                .select('*')\
+                .eq('id', account_id)\
+                .eq('is_active', True)\
+                .single()\
+                .execute()
+            
+            if not account.data:
+                return jsonify({'status': 'error', 'message': 'Account not found'}), 404
+                
+            # Extract NetflixId from cookie_data
+            cookie_data = account.data.get('cookie_data', '')
+            cookies = parse_cookie_string(cookie_data)
+            netflix_id = cookies.get('NetflixId')
+            secure_id = cookies.get('SecureNetflixId')
+            
+        # Case 2: Use custom NetflixId
+        elif custom_netflix_id:
+            netflix_id = custom_netflix_id
+            secure_id = None
+            
+        else:
+            # Case 3: Find working stored account
+            result = supabase.table('netflix_accounts')\
+                .select('*')\
+                .eq('added_by', str(user.id))\
+                .eq('is_active', True)\
+                .order('created_at', desc=True)\
+                .execute()
+            
+            for acc in result.data or []:
+                cookies = parse_cookie_string(acc.get('cookie_data', ''))
+                nid = cookies.get('NetflixId')
+                if nid:
+                    # Quick validation
+                    is_valid, _ = validate_netflix_cookie_quick(nid)
+                    if is_valid:
+                        netflix_id = nid
+                        secure_id = cookies.get('SecureNetflixId')
+                        break
+
+        if not netflix_id:
+            return jsonify({
+                'status': 'error',
+                'message': 'No working NetflixId found. Please check a cookie first.'
+            }), 400
+
+        # Generate token
+        token_result = generate_token_improved(netflix_id, secure_id)
+        
+        if not token_result:
+            return jsonify({
+                'status': 'error',
+                'message': 'Failed to generate token. Netflix may have blocked this request.'
+            }), 500
+
+        # Log generation
+        log_token_generation(
+            account_id=account_id or 'custom',
+            user_id=user.id,
+            ip_address=request.remote_addr,
+            token=token_result['token']
+        )
+
+        return jsonify({
+            'status': 'success',
+            'data': {
+                'token': token_result['token'],
+                'expires': token_result['expires'],
+                'login_urls': token_result['login_urls'],
+                'instructions': [
+                    '1. Make sure your TV is on the Netflix sign-in screen showing a code',
+                    '2. Open the TV link below on your PHONE or PC (NOT the TV browser)',
+                    '3. You will be logged into Netflix automatically',
+                    '4. The TV should link within 10-30 seconds'
+                ]
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"TV login link error: {str(e)}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 #--------------------------------------------------------------
 
 if __name__ == '__main__':

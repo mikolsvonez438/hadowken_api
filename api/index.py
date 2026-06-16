@@ -1931,12 +1931,26 @@ def get_account_stats(user):
 # End of file - no more function definitions after routes
 
 #--------------------------------------------------------------
+def get_val(html, key):
+    """Extract JSON value from Netflix HTML"""
+    m = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"]+)"', html)
+    return m.group(1) if m else None
+
+def get_auth_url(html):
+    """Extract authURL from Netflix TV page"""
+    input_match = re.search(r'name="authURL"\s+value="([^"]+)"', html)
+    if input_match:
+        return input_match.group(1)
+    return get_val(html, "authURL")
+
+
 @app.route('/api/tv-auth', methods=['POST', 'OPTIONS'])
 @cross_origin(supports_credentials=True)
 @require_auth
 def tv_auth(user):
     """
-    TV Device Authentication Flow with BOTH NetflixId and SecureNetflixId.
+    TV Device Authentication Flow — FIXED VERSION
+    Based on working reference: GET /tv8 → extract authURL → POST /tv8 with payload
     """
     if request.method == 'OPTIONS':
         return '', 204
@@ -1954,7 +1968,7 @@ def tv_auth(user):
                 'message': 'TV code must be exactly 8 digits'
             }), 400
 
-        # STEP 1: Get working Netflix credentials (both IDs)
+        # STEP 1: Get working Netflix credentials (both IDs required)
         netflix_id = None
         secure_netflix_id = None
 
@@ -1983,17 +1997,181 @@ def tv_auth(user):
             netflix_id = account['netflix_id']
             secure_netflix_id = account.get('secure_netflix_id')
 
-        # STEP 2: Submit TV code using BOTH cookies
-        result = submit_tv_code_improved(netflix_id, secure_netflix_id, code)
+        # STEP 2: Build cookie string for headers
+        cookie_str = f"NetflixId={netflix_id}"
+        if secure_netflix_id:
+            cookie_str += f"; SecureNetflixId={secure_netflix_id}"
 
-        # Log attempt
-        log_tv_auth_attempt(user.id, code, result.get('status'), request.remote_addr)
+        DESKTOP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
-        return jsonify(result)
+        # ── Step 2a: GET /tv8 to extract authURL ──
+        logger.info("Step 1: GET https://www.netflix.com/tv8")
+        
+        tv8_resp = requests.get(
+            "https://www.netflix.com/tv8",
+            headers={
+                "User-Agent": DESKTOP_UA,
+                "Cookie": cookie_str,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=30,
+            allow_redirects=False  # CRITICAL: Don't follow redirects, check status manually
+        )
 
+        # Check for redirect = expired cookie
+        if tv8_resp.status_code in (301, 302, 303, 307):
+            # Mark cookie as dead
+            _mark_cookie_dead(netflix_id, "Cookie expired (redirect on /tv8)")
+            return jsonify({
+                'status': 'error',
+                'message': 'Cookie expired. Please check a new cookie first.',
+                'retry': True
+            }), 400
+
+        if tv8_resp.status_code != 200:
+            _mark_cookie_dead(netflix_id, f"Status {tv8_resp.status_code} on /tv8")
+            return jsonify({
+                'status': 'error',
+                'message': f'Failed to load TV page: HTTP {tv8_resp.status_code}',
+                'retry': True
+            }), 400
+
+        html = tv8_resp.text
+
+        # Check membership status from page
+        membership_status = get_val(html, "membershipStatus")
+        if membership_status and membership_status != "CURRENT_MEMBER":
+            _mark_cookie_dead(netflix_id, f"Membership status: {membership_status}")
+            return jsonify({
+                'status': 'error',
+                'message': f'Cookie does not have active subscription. Status: {membership_status}',
+                'retry': True
+            }), 400
+
+        # Extract authURL — THIS IS THE KEY
+        auth_url = get_auth_url(html)
+        if not auth_url:
+            logger.error(f"Could not extract authURL. HTML snippet: {html[:2000]}")
+            return jsonify({
+                'status': 'error',
+                'message': 'Could not extract authURL from Netflix. Netflix may have changed their page.'
+            }), 500
+
+        logger.info(f"Extracted authURL: {auth_url[:50]}...")
+
+        # ── Step 2b: POST /tv8 with the activation payload ──
+        logger.info(f"Step 2: POST /tv8 with code {code[:2]}****")
+        
+        payload = {
+            "flow": "websiteSignUp",
+            "authURL": auth_url,
+            "flowMode": "enterTvLoginRendezvousCode",
+            "withFields": "tvLoginRendezvousCode,isTvUrl2",
+            "tvLoginRendezvousCode": code,
+            "action": "nextAction",
+        }
+
+        activate_resp = requests.post(
+            "https://www.netflix.com/tv8",
+            headers={
+                "User-Agent": DESKTOP_UA,
+                "Cookie": cookie_str,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": "https://www.netflix.com/tv8",
+                "Origin": "https://www.netflix.com",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+            data=urllib.parse.urlencode(payload),
+            timeout=30,
+            allow_redirects=False  # CRITICAL: Check redirect location manually
+        )
+
+        # ── Step 3: Parse result based on response ──
+        success = False
+        result_message = ""
+
+        if activate_resp.status_code in (301, 302, 303, 307):
+            location = activate_resp.headers.get("Location", "")
+            logger.info(f"POST redirect to: {location}")
+            
+            if "/tv/out/success" in location or "success" in location.lower():
+                success = True
+                result_message = "TV activated successfully! Your TV should be signed in within 10-30 seconds."
+            elif "/login" in location or "signin" in location.lower():
+                _mark_cookie_dead(netflix_id, "Session dropped during TV activation")
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Session dropped while activating. The cookie may have expired.',
+                    'retry': True
+                }), 400
+            else:
+                result_message = f"Unexpected redirect: {location}"
+                logger.warning(f"Unexpected redirect location: {location}")
+        else:
+            # Check response body for error messages
+            err_text = activate_resp.text
+            
+            # Look for Netflix error message div
+            nf_message_match = re.search(
+                r'class="nf-message-contents"[^>]*>([\s\S]*?)<\/div>',
+                err_text
+            )
+            if nf_message_match:
+                result_message = re.sub(r'<[^>]+>', '', nf_message_match.group(1)).strip()
+            else:
+                # Check for other error indicators
+                if "invalid" in err_text.lower() and "code" in err_text.lower():
+                    result_message = "Invalid TV code. Please generate a new code on your TV."
+                elif "expired" in err_text.lower():
+                    result_message = "TV code has expired. Please generate a new one on your TV."
+                elif "maximum" in err_text.lower() and "device" in err_text.lower():
+                    result_message = "Maximum number of devices reached for this account."
+                else:
+                    result_message = "Failed to activate TV. Please check the code and try again."
+            
+            logger.warning(f"TV activation failed. Status: {activate_resp.status_code}, Message: {result_message}")
+            logger.debug(f"Response body: {err_text[:1000]}")
+
+        # Log the attempt
+        log_tv_auth_attempt(user.id, code, "success" if success else "failed", request.remote_addr)
+
+        if success:
+            return jsonify({
+                'status': 'success',
+                'message': result_message
+            })
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': result_message
+            }), 400
+
+    except requests.RequestException as e:
+        logger.error(f"Network error in TV auth: {str(e)}")
+        return jsonify({'status': 'error', 'message': f'Network error: {str(e)}'}), 500
     except Exception as e:
-        logger.error(f"TV auth error: {str(e)}")
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        logger.error(f"TV auth exception: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'status': 'error', 'message': f'Error: {str(e)}'}), 500
+
+
+def _mark_cookie_dead(netflix_id, reason):
+    """Mark a cookie as dead in the database"""
+    try:
+        supabase.table('netflix_accounts')\
+            .update({
+                'is_active': False,
+                'deactivated_reason': reason,
+                'deactivated_at': datetime.utcnow().isoformat()
+            })\
+            .eq('netflix_id', netflix_id)\
+            .execute()
+    except Exception as e:
+        logger.error(f"Failed to mark cookie as dead: {e}")
+
+
 
 def find_working_account_with_secure_id(user_id):
     """Find first working account that has BOTH NetflixId and SecureNetflixId"""
@@ -2024,7 +2202,11 @@ def find_working_account_with_secure_id(user_id):
             else:
                 # Mark dead account
                 supabase.table('netflix_accounts')\
-                    .update({'is_active': False})\
+                    .update({
+                        'is_active': False,
+                        'deactivated_reason': 'Failed validation during TV auth lookup',
+                        'deactivated_at': datetime.utcnow().isoformat()
+                    })\
                     .eq('id', account['id'])\
                     .execute()
 
@@ -2859,7 +3041,7 @@ def validate_netflix_cookie_quick(cookie_dict):
     session.cookies.update(cookie_dict)
     
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
     }

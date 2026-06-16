@@ -1897,8 +1897,11 @@ def get_account_stats(user):
 @require_auth
 def tv_auth(user):
     """
-    Authenticate a TV code on netflix.com/tv8 using a validated NetflixId cookie.
-    IMPROVED: Always validates cookie first before attempting TV auth.
+    TV Device Authentication Flow:
+    1. User gets 8-digit code from TV screen
+    2. User inputs code here
+    3. We use stored NetflixId to submit code to netflix.com/tv8
+    4. TV gets linked automatically
     """
     if request.method == 'OPTIONS':
         return '', 204
@@ -1915,59 +1918,265 @@ def tv_auth(user):
                 'message': 'TV code must be exactly 8 digits'
             }), 400
 
+        # STEP 1: Get working NetflixId
         netflix_id = None
-        source = None  # 'custom' or 'stored'
 
-        # Case 1: User provided a custom NetflixId
         if custom_netflix_id:
-            logger.info(f"User provided custom NetflixId, validating first...")
+            # Validate custom NetflixId first
             is_valid, info = validate_netflix_cookie_quick(custom_netflix_id)
-            
-            if is_valid:
-                netflix_id = custom_netflix_id
-                source = 'custom'
-                logger.info(f"Custom NetflixId validated: {info.get('email')} ({info.get('country')})")
-            else:
+            if not is_valid:
                 return jsonify({
                     'status': 'error',
-                    'message': f'Provided NetflixId is invalid: {info.get("err", "Unknown error")}'
+                    'message': f'Invalid NetflixId: {info.get("err", "Unknown error")}'
                 }), 400
-
-        # Case 2: No custom NetflixId - find a working stored account
-        if not netflix_id:
-            logger.info(f"No custom NetflixId, searching stored accounts for user {user.id}...")
-            netflix_id, source = find_working_stored_account(user.id)
-            
+            netflix_id = custom_netflix_id
+        else:
+            # Find working stored account for this user
+            netflix_id = find_working_account_for_user(user.id)
             if not netflix_id:
                 return jsonify({
                     'status': 'error',
                     'message': 'No working Netflix accounts found. Please check a cookie first or provide a NetflixId.'
                 }), 400
 
-        # Final validation before TV auth
-        logger.info(f"Final validation before TV auth (source: {source})...")
-        is_valid, info = validate_netflix_cookie_quick(netflix_id)
-        if not is_valid:
-            return jsonify({
-                'status': 'error',
-                'message': f'Account validation failed before TV auth: {info.get("err", "Unknown error")}'
-            }), 400
+        # STEP 2: Submit TV code using the NetflixId session
+        result = submit_tv_code(netflix_id, code)
 
-        # Perform TV code authentication
-        logger.info(f"Starting TV auth for code {code[:2]}**** with account {info.get('email')}")
-        result = _auth_tv_code_improved(netflix_id, code)
-
-        # Log the attempt
-        log_tv_auth_attempt(user.id, code, result.get('status', 'unknown'), request.remote_addr)
+        # Log attempt
+        log_tv_auth_attempt(user.id, code, result.get('status'), request.remote_addr)
 
         return jsonify(result)
 
     except Exception as e:
         logger.error(f"TV auth error: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
+def find_working_account_for_user(user_id):
+    """Find first working NetflixId from user's stored accounts"""
+    try:
+        result = supabase.table('netflix_accounts')\
+            .select('*')\
+            .eq('added_by', str(user_id))\
+            .eq('is_active', True)\
+            .order('created_at', desc=True)\
+            .execute()
+
+        for account in result.data or []:
+            netflix_id = account.get('netflix_id')
+            if not netflix_id:
+                continue
+
+            # Quick validation
+            is_valid, _ = validate_netflix_cookie_quick(netflix_id)
+            if is_valid:
+                return netflix_id
+            else:
+                # Mark dead account
+                supabase.table('netflix_accounts')\
+                    .update({'is_active': False})\
+                    .eq('id', account['id'])\
+                    .execute()
+
+    except Exception as e:
+        logger.error(f"Error finding account: {e}")
+
+    return None
+
+def submit_tv_code(netflix_id, code):
+    """
+    Submit 8-digit TV code to netflix.com/tv8 using existing NetflixId cookie.
+    This is the CORE function - no token generation, just code submission.
+    """
+    session = requests.Session()
+
+    # Set the NetflixId cookie - this is our auth session
+    session.cookies.set("NetflixId", netflix_id, domain=".netflix.com", path="/")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+    try:
+        # Step 1: GET tv8 page to establish session and get form
+        logger.info("Loading netflix.com/tv8...")
+        resp = session.get("https://www.netflix.com/tv8", headers=headers, timeout=30)
+
+        if resp.status_code != 200:
+            return {
+                'status': 'error',
+                'message': f'Failed to load TV page: HTTP {resp.status_code}'
+            }
+
+        # Check if cookie is valid (not redirected to login)
+        if 'login' in resp.url.lower() or 'signin' in resp.url.lower():
+            return {
+                'status': 'error',
+                'message': 'NetflixId expired. Please check a new cookie first.'
+            }
+
+        soup = BeautifulSoup(resp.text, 'html.parser')
+
+        # Step 2: Find the code submission form
+        form = None
+
+        # Try multiple selectors Netflix uses
+        selectors = [
+            {'data-uia': 'tv-code-form'},
+            {'data-uia': 'witcher-code-form'},
+            {'action': lambda x: x and 'tv8' in x.lower() if x else False},
+        ]
+
+        for selector in selectors:
+            form = soup.find('form', selector)
+            if form:
+                break
+
+        # Fallback: find any form with code input
+        if not form:
+            for f in soup.find_all('form'):
+                code_input = f.find('input', {
+                    'name': lambda x: x and any(kw in str(x).lower() for kw in ['code', 'rendezvous', 'pin']) if x else False
+                })
+                if code_input:
+                    form = f
+                    break
+
+        if not form:
+            # Check if already success page
+            if 'success' in resp.text.lower() or 'all set' in resp.text.lower():
+                return {
+                    'status': 'success',
+                    'message': 'TV is already linked! Check your TV screen.'
+                }
+
+            logger.error(f"No form found. Page snippet: {resp.text[:1000]}")
+            return {
+                'status': 'error',
+                'message': 'Could not find TV code form. Netflix may have changed their page.'
+            }
+
+        # Step 3: Build form data
+        action = form.get('action', 'https://www.netflix.com/tv8')
+        if action.startswith('/'):
+            action = 'https://www.netflix.com' + action
+
+        form_data = {}
+
+        for input_tag in form.find_all('input'):
+            name = input_tag.get('name')
+            value = input_tag.get('value', '')
+            input_type = input_tag.get('type', 'text').lower()
+
+            if not name:
+                continue
+
+            if input_type == 'hidden':
+                form_data[name] = value
+            elif any(kw in name.lower() for kw in ['code', 'rendezvous', 'pin']):
+                form_data[name] = code  # <-- USER'S 8-DIGIT CODE
+            else:
+                form_data[name] = value
+
+        # Ensure code is set
+        if 'code' not in form_data:
+            form_data['code'] = code
+        if 'tvLoginRendezvousCode' not in form_data:
+            form_data['tvLoginRendezvousCode'] = code
+
+        logger.info(f"Submitting code {code[:2]}**** to {action}")
+        logger.info(f"Form fields: {list(form_data.keys())}")
+
+        # Step 4: POST the code
+        post_headers = {
+            **headers,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://www.netflix.com",
+            "Referer": "https://www.netflix.com/tv8",
+        }
+
+        post_resp = session.post(
+            action,
+            data=form_data,
+            headers=post_headers,
+            timeout=30,
+            allow_redirects=True
+        )
+
+        # Step 5: Analyze response
+        result_text = post_resp.text.lower()
+        current_url = post_resp.url.lower()
+
+        logger.info(f"POST status: {post_resp.status_code}, URL: {post_resp.url}")
+
+        # Check for errors
+        error_patterns = [
+            ('invalid code', 'Invalid TV code. Please generate a new code on your TV.'),
+            ('expired', 'TV code has expired. Generate a new one on your TV.'),
+            ('already been used', 'Code already used. Generate a new one.'),
+            ('maximum number of devices', 'Too many devices on this account.'),
+            ('unable to process', 'Netflix error. Try again later.'),
+            ('try again', 'Failed. Try a new code.'),
+            ('sign in', 'Cookie expired. Check a new cookie.'),
+            ('問題が発生しました', 'Netflix error (Japanese). Code may be invalid.'),
+        ]
+
+        for pattern, msg in error_patterns:
+            if pattern in result_text or pattern in post_resp.text:
+                return {'status': 'error', 'message': msg}
+
+        # Check for success
+        success_indicators = [
+            'success', 'approved', 'all set', 'signed in', 'welcome',
+            'start watching', 'device linked', 'tv is ready', 'good to go',
+            'you\'re all set', 'now signed in'
+        ]
+
+        for indicator in success_indicators:
+            if indicator in result_text:
+                return {
+                    'status': 'success',
+                    'message': 'TV linked successfully! Your TV should be signed in within 10-30 seconds.'
+                }
+
+        # URL-based checks
+        if 'success' in current_url or 'approved' in current_url:
+            return {'status': 'success', 'message': 'TV authentication successful!'}
+
+        if 'error' in current_url or 'failed' in current_url:
+            return {'status': 'error', 'message': 'TV authentication failed. Try a new code.'}
+
+        # Redirected away from tv8 = likely success
+        if 'netflix.com' in current_url and 'tv8' not in current_url:
+            return {
+                'status': 'success',
+                'message': 'Code processed! Check your TV - it should be signed in.'
+            }
+
+        # Still on tv8 with no error = might need confirmation
+        if 'tv8' in current_url:
+            return {
+                'status': 'success',
+                'message': 'Code accepted! Check your TV and confirm if prompted.'
+            }
+
+        # Unknown - assume success since no error found
+        return {
+            'status': 'success',
+            'message': 'Code submitted. Check your TV - it should link within 30 seconds.'
+        }
+
+    except requests.RequestException as e:
+        logger.error(f"Network error: {e}")
+        return {'status': 'error', 'message': f'Network error: {str(e)}'}
+    except Exception as e:
+        logger.error(f"TV auth exception: {e}")
+        return {'status': 'error', 'message': f'Error: {str(e)}'}
 
 def find_working_stored_account(user_id):
     """

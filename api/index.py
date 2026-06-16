@@ -26,6 +26,7 @@ from flask_limiter.util import get_remote_address
 from flask_talisman import Talisman
 import secrets
 from marshmallow import Schema, fields, validate, ValidationError
+from bs4 import BeautifulSoup
 
 load_dotenv()
 urllib3.disable_warnings(InsecureRequestWarning)
@@ -1887,5 +1888,306 @@ def get_account_stats(user):
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 # End of file - no more function definitions after routes
+
+#--------------------------------------------------------------
+@app.route('/api/tv-auth', methods=['POST', 'OPTIONS'])
+@cross_origin(supports_credentials=True)
+@require_auth
+def tv_auth(user):
+    """
+    Authenticate a TV code on netflix.com/tv8 using the user's NetflixId cookie.
+
+    Request body: {"code": "12345678"}
+    The user's NetflixId is fetched from their stored account or provided cookie.
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    try:
+        data = request.get_json()
+        code = data.get('code', '').strip()
+
+        # Validate code format
+        if not code or len(code) != 8 or not code.isdigit():
+            return jsonify({
+                'status': 'error',
+                'message': 'TV code must be exactly 8 digits'
+            }), 400
+
+        # Get the user's NetflixId from their stored account
+        # First, check if user has a stored Netflix account
+        account = supabase.table('netflix_accounts')\
+            .select('*')\
+            .eq('added_by', str(user.id))\
+            .eq('is_active', True)\
+            .order('created_at', desc=True)\
+            .limit(1)\
+            .execute()
+
+        netflix_id = None
+        if account.data and len(account.data) > 0:
+            netflix_id = account.data[0].get('netflix_id')
+
+        # If no stored account, check if NetflixId was provided in request
+        if not netflix_id:
+            netflix_id = data.get('netflix_id')
+
+        if not netflix_id:
+            return jsonify({
+                'status': 'error',
+                'message': 'No NetflixId found. Please check a cookie first or provide a netflix_id.'
+            }), 400
+
+        # Perform TV code authentication
+        result = _auth_tv_code(netflix_id, code)
+
+        # Log the attempt
+        log_tv_auth_attempt(user.id, code, result['status'], request.remote_addr)
+
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"TV auth error: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+def _auth_tv_code(netflix_id, code):
+    """
+    Internal function to authenticate a TV code on netflix.com/tv8.
+
+    This mimics the PHP example:
+    1. GET netflix.com/tv8 with NetflixId cookie
+    2. Find form with data-uia="witcher-code-form"
+    3. POST the code
+    4. Check for errors
+    """
+    session = requests.Session()
+    session.cookies.set("NetflixId", netflix_id, domain=".netflix.com")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+    try:
+        # Step 1: GET tv8 page
+        resp = session.get("https://www.netflix.com/tv8", headers=headers, timeout=30)
+
+        if resp.status_code != 200:
+            return {
+                'status': 'error',
+                'message': f'Failed to load tv8 page: HTTP {resp.status_code}'
+            }
+
+        soup = BeautifulSoup(resp.text, 'html.parser')
+
+        # Find the code form - try multiple selectors
+        form = None
+
+        # Primary: data-uia attribute (from your PHP example)
+        form = soup.find('form', {'data-uia': 'witcher-code-form'})
+
+        # Fallback: form with code input
+        if not form:
+            forms = soup.find_all('form')
+            for f in forms:
+                code_input = f.find('input', {'name': lambda x: x and 'code' in x.lower() if x else False})
+                if code_input:
+                    form = f
+                    break
+
+        # Another fallback: any form with action containing 'tv'
+        if not form:
+            forms = soup.find_all('form')
+            for f in forms:
+                action = f.get('action', '')
+                if 'tv' in action.lower() or 'code' in action.lower():
+                    form = f
+                    break
+
+        if not form:
+            # Check if page shows "already signed in" or similar
+            page_text = resp.text.lower()
+            if 'sign in' in page_text and 'netflix' in page_text:
+                return {
+                    'status': 'error',
+                    'message': 'Cookie may be expired or invalid. Netflix is asking for sign-in.'
+                }
+
+            return {
+                'status': 'error',
+                'message': 'Could not find the TV code form. Netflix may have updated their page structure.'
+            }
+
+        # Extract form action
+        action = form.get('action')
+        if not action:
+            action = 'https://www.netflix.com/tv8'
+        elif action.startswith('/'):
+            action = 'https://www.netflix.com' + action
+
+        # Build form data from all inputs
+        form_data = {}
+        for input_tag in form.find_all('input'):
+            name = input_tag.get('name')
+            value = input_tag.get('value', '')
+            input_type = input_tag.get('type', 'text')
+
+            if name:
+                # Don't overwrite hidden fields, but set code fields
+                if input_type == 'hidden':
+                    form_data[name] = value
+                elif 'code' in name.lower() or 'rendezvous' in name.lower():
+                    form_data[name] = code
+                else:
+                    form_data[name] = value
+
+        # Ensure code is set
+        if 'code' not in form_data:
+            form_data['code'] = code
+        if 'tvLoginRendezvousCode' not in form_data:
+            form_data['tvLoginRendezvousCode'] = code
+
+        # Step 2: POST the form
+        post_headers = {
+            **headers,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://www.netflix.com",
+            "Referer": "https://www.netflix.com/tv8",
+        }
+
+        post_resp = session.post(
+            action, 
+            data=form_data, 
+            headers=post_headers, 
+            timeout=30, 
+            allow_redirects=True
+        )
+
+        # Step 3: Analyze response
+        result_soup = BeautifulSoup(post_resp.text, 'html.parser')
+
+        # Check for error box (from your PHP example)
+        error_box = (
+            result_soup.find('form', {'data-uia': 'witcher-code-form'})
+        )
+
+        if error_box:
+            error_div = error_box.find('div', {'class': 'error-box'})
+            if error_div:
+                error_msg = error_div.get_text(strip=True)
+                return {
+                    'status': 'error',
+                    'message': error_msg or 'Invalid or expired TV code'
+                }
+
+        # Check for general error messages
+        error_msgs = result_soup.find_all(['div', 'span'], {'class': lambda x: x and 'error' in x.lower() if x else False})
+        for err in error_msgs:
+            err_text = err.get_text(strip=True)
+            if err_text and len(err_text) > 5:
+                return {'status': 'error', 'message': err_text}
+
+        # Check for success indicators
+        page_text = post_resp.text.lower()
+        current_url = post_resp.url.lower()
+
+        success_indicators = [
+            'success',
+            'approved',
+            'you\'re all set',
+            'now signed in',
+            'welcome',
+            'start watching',
+            'enjoy',
+        ]
+
+        error_indicators = [
+            'invalid code',
+            'expired',
+            'try again',
+            'incorrect',
+            'doesn\'t work',
+            'unable to process',
+        ]
+
+        for indicator in error_indicators:
+            if indicator in page_text:
+                return {'status': 'error', 'message': f'Code validation failed: {indicator}'}
+
+        for indicator in success_indicators:
+            if indicator in page_text:
+                return {'status': 'success', 'message': f'TV code approved! {indicator}'}
+
+        # Check if redirected to login (cookie issue)
+        if 'login' in current_url or 'signin' in current_url:
+            return {
+                'status': 'error',
+                'message': 'Your Netflix session has expired. Please update your cookie.'
+            }
+
+        # Check if on approval confirmation page
+        if 'approve' in page_text or 'confirm' in page_text or 'authorize' in page_text:
+            return {
+                'status': 'success',
+                'message': 'Code accepted! Please confirm the approval on Netflix.'
+            }
+
+        # If we got a redirect to a non-tv8 page, likely success
+        if 'netflix.com' in current_url and 'tv8' not in current_url and 'tv' not in current_url:
+            return {
+                'status': 'success',
+                'message': 'TV code processed. Check your TV - it should be signed in now.'
+            }
+
+        return {
+            'status': 'unknown',
+            'message': 'Response was unclear. The code may have been processed.',
+            'debug_url': current_url
+        }
+
+    except requests.RequestException as e:
+        return {'status': 'error', 'message': f'Network error: {str(e)}'}
+    except Exception as e:
+        logger.error(f"TV auth exception: {str(e)}")
+        return {'status': 'error', 'message': f'Error: {str(e)}'}
+
+
+def log_tv_auth_attempt(user_id, code, status, ip_address):
+    """Log TV authentication attempts"""
+    try:
+        headers = {
+            'apikey': SUPABASE_SERVICE_KEY,
+            'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
+            'Content-Type': 'application/json',
+            'Prefer': 'return=representation'
+        }
+
+        log_data = {
+            'user_id': str(user_id),
+            'tv_code': code[:4] + '****',  # Mask for privacy
+            'status': status,
+            'ip_address': str(ip_address) if ip_address else None
+        }
+
+        url = f"{SUPABASE_URL}/rest/v1/tv_auth_logs"
+        resp = requests.post(url, headers=headers, json=log_data)
+
+        if resp.status_code == 201:
+            logger.info(f"TV auth log SUCCESS")
+        else:
+            logger.error(f"TV auth log FAILED: {resp.status_code}")
+
+    except Exception as e:
+        logger.error(f"TV auth log error: {str(e)}")
+#--------------------------------------------------------------
+
 if __name__ == '__main__':
     app.run(debug=True)

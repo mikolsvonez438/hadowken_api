@@ -1299,16 +1299,24 @@ def process_single_file(file, mode, is_premium_user, user_id):
         }
 
 def process_content(content, filename, mode, is_premium_user, user_id):
-    netflix_id = extract_netflix_credentials(content)
+    credentials = extract_netflix_credentials(content)
     
-    if not netflix_id:
+    if not credentials:
         return {
             "status": "error", 
             "filename": filename, 
             "message": "No NetflixId found"
         }
     
-    account_info = check_netflix_cookie({"NetflixId": netflix_id})
+    netflix_id = credentials['netflix_id']
+    secure_netflix_id = credentials.get('secure_netflix_id')
+    
+    # Build cookie dict with BOTH IDs
+    cookie_dict = {"NetflixId": netflix_id}
+    if secure_netflix_id:
+        cookie_dict["SecureNetflixId"] = secure_netflix_id
+    
+    account_info = check_netflix_cookie(cookie_dict)
     
     if not account_info["ok"]:
         return {
@@ -1321,6 +1329,7 @@ def process_content(content, filename, mode, is_premium_user, user_id):
         store_netflix_account(
             email=account_info["email"],
             netflix_id=netflix_id,
+            secure_netflix_id=secure_netflix_id,
             subscription_type=account_info["subscription_type"],
             country=account_info["country"],
             plan=account_info["plan"],

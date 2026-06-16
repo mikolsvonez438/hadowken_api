@@ -30,7 +30,6 @@ from bs4 import BeautifulSoup
 import random
 import string
 
-
 load_dotenv()
 urllib3.disable_warnings(InsecureRequestWarning)
 
@@ -1300,7 +1299,7 @@ def process_single_file(file, mode, is_premium_user, user_id):
         }
 
 def process_content(content, filename, mode, is_premium_user, user_id):
-    netflix_id = extract_netflix_id(content)
+    netflix_id = extract_netflix_credentials(content)
     
     if not netflix_id:
         return {

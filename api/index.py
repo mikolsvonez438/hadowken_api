@@ -30,6 +30,7 @@ from bs4 import BeautifulSoup
 import random
 import string
 
+
 load_dotenv()
 urllib3.disable_warnings(InsecureRequestWarning)
 

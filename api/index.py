@@ -1127,7 +1127,7 @@ def check_cookie(user):
                 }
             })
         
-        token_result = generate_token(netflix_id,secure_netflix_id)
+        token_result = generate_token(netflix_id)
         
         if token_result["status"] != "Success":
             return jsonify({

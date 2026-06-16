@@ -1427,6 +1427,7 @@ def get_accounts(user):
                 'plan': acc['plan'],
                 'created_at': acc['created_at'],
                 'last_checked': acc['last_checked'],
+                'secure_netflix_id': acc['secure_netflix_id'],
                 'days_until_billing': days_left,
                 'next_billing_date': acc.get('next_billing_date')
             }

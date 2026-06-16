@@ -461,8 +461,8 @@ def check_netflix_cookie(cookie_dict):
 
         # Check 2: Not on account page = not logged in
         if '"mode":"yourAccount"' not in txt:
-            # if 'payment' in txt_lower or 'billing' in txt_lower or 'update your payment' in txt_lower:
-            #     return {'ok': False, 'err': 'Payment required'}
+            if 'payment' in txt_lower or 'billing' in txt_lower or 'update your payment' in txt_lower:
+                return {'ok': False, 'err': 'Payment required'}
             if 'membership has been canceled' in txt_lower or 'canceled' in txt_lower:
                 return {'ok': False, 'err': 'Membership canceled'}
             if 'restart' in txt_lower and 'membership' in txt_lower:
@@ -475,7 +475,7 @@ def check_netflix_cookie(cookie_dict):
         if 'your membership is on hold' in txt_lower or 'on hold' in txt_lower:
             return {'ok': False, 'err': 'Membership on hold'}
         
-        if 'please update your payment method' in txt_lower or 'payment method' in txt_lower:
+        if 'please update your payment method' in txt_lower:
             return {'ok': False, 'err': 'Payment method required'}
 
         def find(pattern, flags=0):

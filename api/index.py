@@ -1708,7 +1708,6 @@ def cron_validate_accounts():
 @cross_origin(supports_credentials=True)
 @require_super_admin
 def bulk_recheck_accounts(user):
-    """Process accounts in chunks like batch-check, return JSON (not SSE)"""
     if request.method == 'OPTIONS':
         return '', 204
 
@@ -1724,6 +1723,7 @@ def bulk_recheck_accounts(user):
         chunk_size = data.get('chunk_size', 15)
         offset = data.get('offset', 0)
         
+        # Get accounts that need rechecking
         fetch_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?select=*&is_active=eq.true&order=created_at.desc&limit={chunk_size}&offset={offset}"
         fetch_resp = requests.get(fetch_url, headers=headers, timeout=30)
         
@@ -1746,95 +1746,96 @@ def bulk_recheck_accounts(user):
         invalid_count = 0
         
         for account in accounts:
-            try:
-                netflix_id = account.get('netflix_id')
-                email = account.get('email', 'Unknown')
-                
-                if not netflix_id:
-                    results.append({
-                        'email': email,
-                        'status': 'error',
-                        'reason': 'Missing NetflixId'
-                    })
-                    continue
-
-                # Check cookie
-                account_info = check_netflix_cookie({"NetflixId": netflix_id})
-                
-                # CRITICAL FIX: Check both 'ok' AND 'err' keys
-                # 'ok' can be False with 'err' explaining why
-                is_valid = account_info.get('ok', False)
-                error_reason = account_info.get('err', 'Unknown error')
-                
-                # Additional safety: if ok is True but no email/plan, something is wrong
-                if is_valid and (not account_info.get('email') or account_info.get('email') == 'Unknown'):
-                    is_valid = False
-                    error_reason = 'Incomplete account data (missing email)'
-                
-                # Additional safety: if ok is True but plan is Unknown and not premium, likely expired
-                if is_valid and account_info.get('plan') == 'Unknown' and not account_info.get('premium', False):
-                    is_valid = False
-                    error_reason = 'Unknown plan, likely expired or invalid'
-                
-                if is_valid:
-                    # Update valid account
-                    update_data = {
-                        'last_checked': datetime.utcnow().isoformat(),
-                        'plan': account_info['plan'],
-                        'subscription_type': account_info['subscription_type'],
-                        'country': account_info['country'],
-                        'is_active': True,
-                        'is_premium': account_info['premium'],
-                        'next_billing_date': account_info.get('next_billing_date'),
-                        'days_until_billing': account_info.get('days_until_billing'),
-                        'is_expired': False,
-                        'deactivated_reason': None,
-                        'deactivated_at': None
-                    }
-                    
-                    update_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?id=eq.{account['id']}"
-                    requests.patch(update_url, headers=headers, json=update_data, timeout=30)
-                    
-                    valid_count += 1
-                    results.append({
-                        'email': email,
-                        'status': 'valid',
-                        'plan': account_info['plan'],
-                        'country': account_info['country']
-                    })
-                    
-                else:
-                    # Mark as inactive - use the error reason from check_netflix_cookie
-                    update_data = {
-                        'is_active': False,
-                        'last_checked': datetime.utcnow().isoformat(),
-                        'deactivated_reason': error_reason,
-                        'deactivated_at': datetime.utcnow().isoformat(),
-                        'is_expired': True,
-                        'is_premium': False
-                    }
-                    
-                    update_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?id=eq.{account['id']}"
-                    requests.patch(update_url, headers=headers, json=update_data, timeout=30)
-                    
-                    invalid_count += 1
-                    results.append({
-                        'email': email,
-                        'status': 'invalid',
-                        'reason': error_reason
-                    })
-
-                time.sleep(1.5)
-
-            except Exception as e:
-                logger.error(f"Error checking account {account.get('id')}: {e}")
-                results.append({
-                    'email': account.get('email', 'Unknown'),
-                    'status': 'error',
-                    'reason': str(e)[:200]
-                })
+            account_id = account['id']
+            netflix_id = account.get('netflix_id')
+            email = account.get('email', 'Unknown')
+            
+            if not netflix_id:
+                # Mark as invalid immediately
+                _deactivate_account(account_id, 'Missing NetflixId', headers)
+                invalid_count += 1
+                results.append({'email': email, 'status': 'invalid', 'reason': 'Missing NetflixId'})
                 continue
 
+            try:
+                account_info = check_netflix_cookie({"NetflixId": netflix_id})
+            except Exception as e:
+                logger.error(f"Exception checking {email}: {e}")
+                # CRITICAL: Mark as invalid on ANY exception
+                _deactivate_account(account_id, f'Check exception: {str(e)[:100]}', headers)
+                invalid_count += 1
+                results.append({'email': email, 'status': 'invalid', 'reason': f'Check failed: {str(e)[:100]}'})
+                continue
+            
+            # Determine validity
+            is_valid = account_info.get('ok', False)
+            error_reason = account_info.get('err', 'Unknown error')
+            
+            # Additional safety checks
+            if is_valid and (not account_info.get('email') or account_info.get('email') == 'Unknown'):
+                is_valid = False
+                error_reason = 'Incomplete account data (missing email)'
+            
+            if is_valid and account_info.get('plan') == 'Unknown' and not account_info.get('premium', False):
+                is_valid = False
+                error_reason = 'Unknown plan, likely expired or invalid'
+            
+            if is_valid:
+                # Update valid account
+                update_data = {
+                    'last_checked': datetime.now(timezone.utc).isoformat(),
+                    'plan': account_info['plan'],
+                    'subscription_type': account_info['subscription_type'],
+                    'country': account_info['country'],
+                    'is_active': True,
+                    'is_premium': account_info['premium'],
+                    'next_billing_date': account_info.get('next_billing_date'),
+                    'days_until_billing': account_info.get('days_until_billing'),
+                    'is_expired': False,
+                    'deactivated_reason': None,
+                    'deactivated_at': None
+                }
+                
+                update_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?id=eq.{account_id}"
+                patch_resp = requests.patch(update_url, headers=headers, json=update_data, timeout=30)
+                
+                if patch_resp.status_code not in [200, 204]:
+                    logger.error(f"PATCH valid failed for {account_id}: {patch_resp.status_code}")
+                
+                valid_count += 1
+                results.append({
+                    'email': email,
+                    'status': 'valid',
+                    'plan': account_info['plan'],
+                    'country': account_info['country']
+                })
+                
+            else:
+                # Mark as invalid
+                success = _deactivate_account(
+                    account_id, 
+                    error_reason, 
+                    headers,
+                    extra_data={
+                        'plan': account_info.get('plan', 'Unknown'),
+                        'country': account_info.get('country', 'Unknown'),
+                        'is_premium': False
+                    }
+                )
+                
+                if not success:
+                    logger.error(f"Failed to deactivate {account_id}")
+                
+                invalid_count += 1
+                results.append({
+                    'email': email,
+                    'status': 'invalid',
+                    'reason': error_reason
+                })
+
+            time.sleep(1.5)
+
+        # Check if more accounts exist
         next_offset = offset + len(accounts)
         count_resp = requests.get(
             f"{SUPABASE_URL}/rest/v1/netflix_accounts?select=*&is_active=eq.true&limit=1&offset={next_offset}",
@@ -1858,6 +1859,33 @@ def bulk_recheck_accounts(user):
         import traceback
         logger.error(traceback.format_exc())
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+def _deactivate_account(account_id, reason, headers, extra_data=None):
+    """Helper to mark account as inactive with proper error handling"""
+    update_data = {
+        'is_active': False,
+        'last_checked': datetime.now(timezone.utc).isoformat(),
+        'deactivated_reason': reason,
+        'deactivated_at': datetime.now(timezone.utc).isoformat(),
+        'is_expired': True,
+        'is_premium': False
+    }
+    if extra_data:
+        update_data.update(extra_data)
+    
+    update_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?id=eq.{account_id}"
+    
+    try:
+        patch_resp = requests.patch(update_url, headers=headers, json=update_data, timeout=30)
+        if patch_resp.status_code in [200, 204]:
+            return True
+        else:
+            logger.error(f"Deactivate PATCH failed: {patch_resp.status_code} - {patch_resp.text[:200]}")
+            return False
+    except Exception as e:
+        logger.error(f"Deactivate exception: {e}")
+        return False
 
 @app.route('/api/admin/account-stats', methods=['GET', 'OPTIONS'])
 @cross_origin(supports_credentials=True)

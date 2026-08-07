@@ -18,14 +18,14 @@ begin
 
   if existing_id is null then
     perform vault.create_secret(
-      'https://hadowken-api.vercel.app/api/cron/validate-accounts',
+      'https://hadowken-api.vercel.app/api/cron/validate-accounts?batch_size=25',
       'account_validation_api_url',
       'Backend endpoint called by the account health cron'
     );
   else
     perform vault.update_secret(
       existing_id,
-      'https://hadowken-api.vercel.app/api/cron/validate-accounts',
+      'https://hadowken-api.vercel.app/api/cron/validate-accounts?batch_size=25',
       'account_validation_api_url',
       'Backend endpoint called by the account health cron'
     );
@@ -68,11 +68,18 @@ exception when others then null;
 end
 $$;
 
--- Every hour, validate up to 20 records whose last check is at least 24 hours old.
+do $$
+begin
+  perform cron.unschedule('netflix-account-validation-batches');
+exception when others then null;
+end
+$$;
+
+-- Every 15 minutes, validate up to 25 records whose last check is at least 24 hours old.
 -- Recently checked records are skipped, avoiding unnecessary repeated validation.
 select cron.schedule(
-  'hourly-netflix-account-validation',
-  '0 * * * *',
+  'netflix-account-validation-batches',
+  '*/15 * * * *',
   $job$
     select net.http_get(
       url := (

@@ -889,7 +889,7 @@ def log_token_generation(account_id, user_id, ip_address, token=None):
             log_data['token'] = token[:100]
         
         url = f"{SUPABASE_URL}/rest/v1/token_logs"
-        resp = requests.post(url, headers=headers, json=log_data)
+        resp = requests.post(url, headers=headers, json=log_data, timeout=5)
         
         if resp.status_code == 201:
             logger.info(f"Token log SUCCESS")
@@ -2212,10 +2212,7 @@ def get_auth_url(html):
     return get_val(html, "authURL")
 
 
-@app.route('/api/tv-auth', methods=['POST', 'OPTIONS'])
-@cross_origin(supports_credentials=True)
-@require_auth
-def tv_auth(user):
+def _legacy_tv_auth(user):
     """
     TV Device Authentication Flow — FIXED VERSION
     Based on working reference: GET /tv8 → extract authURL → POST /tv8 with payload
@@ -2442,44 +2439,18 @@ def _mark_cookie_dead(netflix_id, reason):
 
 
 def find_working_account_with_secure_id(user_id):
-    """Find first working account that has BOTH NetflixId and SecureNetflixId"""
+    """Backward-compatible helper using the same randomized shared TV pool."""
     try:
-        result = supabase.table('netflix_accounts')\
-            .select('*')\
-            .eq('added_by', str(user_id))\
-            .eq('is_active', True)\
-            .not_.is_('secure_netflix_id', 'null')\
-            .order('created_at', desc=True)\
-            .execute()
-
-        for account in result.data or []:
-            netflix_id = account.get('netflix_id')
-            secure_id = account.get('secure_netflix_id')
-            
-            if not netflix_id or not secure_id:
-                continue
-
-            # Quick validation with BOTH cookies
-            cookie_dict = {
-                "NetflixId": netflix_id,
-                "SecureNetflixId": secure_id
-            }
-            is_valid, _ = validate_netflix_cookie_quick(cookie_dict)
+        for account in _get_random_tv_candidates(get_viewer_country()):
+            is_valid, info = validate_netflix_cookie_quick({
+                'NetflixId': account['netflix_id'],
+                'SecureNetflixId': account['secure_netflix_id']
+            })
+            _record_tv_validation(account, is_valid, info)
             if is_valid:
                 return account
-            else:
-                # Mark dead account
-                supabase.table('netflix_accounts')\
-                    .update({
-                        'is_active': False,
-                        'deactivated_reason': 'Failed validation during TV auth lookup',
-                        'deactivated_at': datetime.utcnow().isoformat()
-                    })\
-                    .eq('id', account['id'])\
-                    .execute()
-
-    except Exception as e:
-        logger.error(f"Error finding account with secure ID: {e}")
+    except Exception as exc:
+        logger.error(f'Error finding account with secure ID: {exc}')
 
     return None
 
@@ -2583,6 +2554,341 @@ def validate_netflix_cookie_quick(cookie_dict):
         return False, {'err': f'Network error: {str(e)}'}
     except Exception as e:
         return False, {'err': f'Validation error: {str(e)}'}
+
+
+TV_DESKTOP_UA = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+)
+
+
+def _tv_env_int(name, default, minimum, maximum):
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _tv_service_headers(prefer='return=minimal'):
+    return {
+        'apikey': SUPABASE_SERVICE_KEY,
+        'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
+        'Content-Type': 'application/json',
+        'Prefer': prefer
+    }
+
+
+def _tv_account_summary(account):
+    """Return only display-safe account data; never return Netflix cookies."""
+    return {
+        'id': account.get('id'),
+        'email': account.get('email') or 'Unknown',
+        'country': account.get('country') or 'Unknown',
+        'plan': account.get('plan') or account.get('subscription_type') or 'Unknown'
+    }
+
+
+def _get_random_tv_candidates(viewer_country):
+    """Fetch the shared active pool and randomize it for each TV-login request."""
+    pool_limit = _tv_env_int('TV_AUTH_POOL_LIMIT', 1000, 1, 1000)
+    params = {
+        'select': (
+            'id,email,country,plan,subscription_type,netflix_id,secure_netflix_id,'
+            'days_until_billing'
+        ),
+        'is_active': 'eq.true',
+        'is_premium': 'eq.true',
+        'is_expired': 'eq.false',
+        'netflix_id': 'not.is.null',
+        'secure_netflix_id': 'not.is.null',
+        'limit': str(pool_limit)
+    }
+    response = requests.get(
+        f'{SUPABASE_URL}/rest/v1/netflix_accounts',
+        headers=_tv_service_headers(),
+        params=params,
+        timeout=20
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f'Unable to load the TV account pool ({response.status_code})')
+
+    candidates = []
+    for account in response.json():
+        if not account.get('netflix_id') or not account.get('secure_netflix_id'):
+            continue
+        days_left = account.get('days_until_billing')
+        if days_left is not None and days_left < -3:
+            continue
+        _, region_compatible = get_region_compatibility(
+            account.get('plan'), account.get('subscription_type'), viewer_country
+        )
+        if region_compatible is False:
+            continue
+        candidates.append(account)
+
+    random.SystemRandom().shuffle(candidates)
+    return candidates
+
+
+def _record_tv_validation(account, is_valid, info):
+    """Persist TV pre-check results without killing accounts on temporary network errors."""
+    account_id = account.get('id')
+    if not account_id:
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    if is_valid:
+        update_data = {
+            'last_checked': now,
+            'validation_status': 'working',
+            'last_validation_error': None,
+            'consecutive_failures': 0,
+            'is_active': True,
+            'is_expired': False,
+            'deactivated_reason': None,
+            'deactivated_at': None
+        }
+        if info.get('email') and info.get('email') != 'Unknown':
+            update_data['email'] = info['email']
+        if info.get('country') and info.get('country') != 'Unknown':
+            update_data['country'] = info['country']
+        if info.get('plan') and info.get('plan') != 'Unknown':
+            update_data['plan'] = info['plan']
+    else:
+        health_status, reason = classify_account_health({'ok': False, **(info or {})})
+        update_data = {
+            'last_checked': now,
+            'validation_status': health_status,
+            'last_validation_error': reason
+        }
+        if health_status in ('expired', 'dead'):
+            update_data.update({
+                'is_active': False,
+                'is_premium': False,
+                'is_expired': health_status == 'expired',
+                'deactivated_reason': reason,
+                'deactivated_at': now
+            })
+        # Unknown/network failures are recorded but the account stays active.
+
+    try:
+        patch_account_health(account_id, update_data, _tv_service_headers())
+    except Exception as exc:
+        logger.error(f'Unable to save TV validation for account {account_id}: {exc}')
+
+
+def _prepare_tv_candidate(account):
+    """Confirm the candidate can load Netflix TV login and return its live session/authURL."""
+    session = requests.Session()
+    session.cookies.update({
+        'NetflixId': account['netflix_id'],
+        'SecureNetflixId': account['secure_netflix_id']
+    })
+    session.headers.update({
+        'User-Agent': TV_DESKTOP_UA,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9'
+    })
+
+    try:
+        response = session.get(
+            'https://www.netflix.com/tv8', timeout=15, allow_redirects=False
+        )
+    except requests.RequestException as exc:
+        return 'transient', f'Network error loading TV login: {exc}', None
+
+    if response.status_code in (301, 302, 303, 307, 308):
+        location = response.headers.get('Location', '')
+        return 'invalid', f'Cookie expired (TV login redirected to {location or "login"})', None
+    if response.status_code == 429 or response.status_code >= 500:
+        return 'transient', f'Netflix TV login temporarily returned HTTP {response.status_code}', None
+    if response.status_code != 200:
+        return 'transient', f'Netflix TV login returned HTTP {response.status_code}', None
+
+    membership_status = get_val(response.text, 'membershipStatus')
+    if membership_status and membership_status != 'CURRENT_MEMBER':
+        return 'invalid', f'Membership status: {membership_status}', None
+
+    auth_url = get_auth_url(response.text)
+    if not auth_url:
+        return 'transient', 'Netflix TV page did not provide an authURL', None
+
+    return 'ready', None, {'session': session, 'auth_url': auth_url}
+
+
+def _activate_tv_candidate(prepared, code):
+    """Submit the TV code and say whether another account may safely be attempted."""
+    payload = {
+        'flow': 'websiteSignUp',
+        'authURL': prepared['auth_url'],
+        'flowMode': 'enterTvLoginRendezvousCode',
+        'withFields': 'tvLoginRendezvousCode,isTvUrl2',
+        'tvLoginRendezvousCode': code,
+        'action': 'nextAction'
+    }
+    try:
+        response = prepared['session'].post(
+            'https://www.netflix.com/tv8',
+            headers={
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Referer': 'https://www.netflix.com/tv8',
+                'Origin': 'https://www.netflix.com'
+            },
+            data=urllib.parse.urlencode(payload),
+            timeout=20,
+            allow_redirects=False
+        )
+    except requests.RequestException as exc:
+        return 'system_error', f'Network error submitting TV code: {exc}', False
+
+    if response.status_code in (301, 302, 303, 307, 308):
+        location = response.headers.get('Location', '')
+        lowered_location = location.lower()
+        if '/tv/out/success' in lowered_location or 'success' in lowered_location:
+            return (
+                'success',
+                'TV activated successfully! Your TV should sign in within 10-30 seconds.',
+                False
+            )
+        if '/login' in lowered_location or 'signin' in lowered_location:
+            return 'account_failure', 'Account session expired during TV activation', True
+        return 'code_error', f'Netflix returned an unexpected TV response: {location}', False
+
+    body = response.text or ''
+    body_lower = body.lower()
+    message_match = re.search(
+        r'class="nf-message-contents"[^>]*>([\s\S]*?)</div>', body
+    )
+    message = (
+        re.sub(r'<[^>]+>', '', message_match.group(1)).strip()
+        if message_match else ''
+    )
+
+    if 'maximum' in body_lower and 'device' in body_lower:
+        return 'account_failure', message or 'Maximum devices reached for this account', False
+    if ('invalid' in body_lower and 'code' in body_lower) or 'incorrect code' in body_lower:
+        return 'code_error', message or 'Invalid TV code. Generate a new code on your TV.', False
+    if 'expired' in body_lower and 'code' in body_lower:
+        return 'code_error', message or 'TV code expired. Generate a new code on your TV.', False
+    if response.status_code == 429 or response.status_code >= 500:
+        return 'system_error', message or f'Netflix temporarily returned HTTP {response.status_code}', False
+    return 'code_error', message or 'Netflix rejected the TV code. Generate a new code and try again.', False
+
+
+@app.route('/api/tv-auth', methods=['POST', 'OPTIONS'])
+@cross_origin(supports_credentials=True)
+@require_auth
+def tv_auth(user):
+    """Randomly select and verify a working account before linking a TV."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    if not has_premium_access(user.id):
+        return jsonify({'status': 'error', 'message': 'Premium subscription required'}), 403
+
+    data = request.get_json(silent=True) or {}
+    code = str(data.get('code') or '').strip()
+    custom_netflix_id = str(data.get('netflix_id') or '').strip()
+    custom_secure_id = str(data.get('secure_netflix_id') or '').strip()
+    if not re.fullmatch(r'\d{8}', code):
+        return jsonify({'status': 'error', 'message': 'TV code must be exactly 8 digits'}), 400
+    if bool(custom_netflix_id) != bool(custom_secure_id):
+        return jsonify({
+            'status': 'error',
+            'message': 'Both NetflixId and SecureNetflixId are required for a custom account'
+        }), 400
+
+    max_attempts = _tv_env_int('TV_AUTH_MAX_ACCOUNT_ATTEMPTS', 8, 1, 25)
+    total_timeout = _tv_env_int('TV_AUTH_TOTAL_TIMEOUT_SECONDS', 45, 15, 120)
+    started_at = time.monotonic()
+    viewer_country = get_viewer_country()
+
+    if custom_netflix_id:
+        candidates = [{
+            'id': None,
+            'email': 'Custom account',
+            'country': 'Unknown',
+            'plan': 'Unknown',
+            'netflix_id': custom_netflix_id,
+            'secure_netflix_id': custom_secure_id
+        }]
+        max_attempts = 1
+    else:
+        try:
+            candidates = _get_random_tv_candidates(viewer_country)
+        except Exception as exc:
+            logger.exception('Unable to load TV candidates')
+            return jsonify({'status': 'error', 'message': str(exc)}), 500
+        if not candidates:
+            return jsonify({
+                'status': 'error',
+                'message': 'No active TV-compatible accounts with SecureNetflixId are available'
+            }), 400
+
+    attempts = 0
+    skipped_reasons = []
+    for account in candidates[:max_attempts]:
+        if attempts and time.monotonic() - started_at >= total_timeout:
+            break
+        attempts += 1
+        cookie_dict = {
+            'NetflixId': account['netflix_id'],
+            'SecureNetflixId': account['secure_netflix_id']
+        }
+        is_valid, info = validate_netflix_cookie_quick(cookie_dict)
+        if account.get('id'):
+            _record_tv_validation(account, is_valid, info)
+        if not is_valid:
+            reason = (info or {}).get('err', 'Cookie validation failed')
+            skipped_reasons.append(reason)
+            if custom_netflix_id:
+                return jsonify({'status': 'error', 'message': f'Custom account is invalid: {reason}'}), 400
+            continue
+
+        prepare_status, prepare_reason, prepared = _prepare_tv_candidate(account)
+        if prepare_status != 'ready':
+            skipped_reasons.append(prepare_reason)
+            if prepare_status == 'invalid' and account.get('id'):
+                _record_tv_validation(account, False, {'err': prepare_reason})
+            if custom_netflix_id:
+                return jsonify({'status': 'error', 'message': prepare_reason}), 400
+            continue
+
+        result_status, message, deactivate = _activate_tv_candidate(prepared, code)
+        if result_status == 'success':
+            log_tv_auth_attempt(user.id, code, 'success', request.remote_addr)
+            return jsonify({
+                'status': 'success',
+                'message': message,
+                'account_used': _tv_account_summary(account),
+                'accounts_checked': attempts
+            })
+        if result_status == 'account_failure' and not custom_netflix_id:
+            skipped_reasons.append(message)
+            if deactivate and account.get('id'):
+                _record_tv_validation(account, False, {'err': message})
+            continue
+
+        log_tv_auth_attempt(user.id, code, 'failed', request.remote_addr)
+        return jsonify({
+            'status': 'error',
+            'message': message,
+            'accounts_checked': attempts
+        }), 503 if result_status == 'system_error' else 400
+
+    log_tv_auth_attempt(user.id, code, 'no_working_account', request.remote_addr)
+    timed_out = time.monotonic() - started_at >= total_timeout
+    message = (
+        f'No usable account was found before the {total_timeout}-second safety limit.'
+        if timed_out else f'No usable account was found after checking {attempts} random account(s).'
+    )
+    return jsonify({
+        'status': 'error',
+        'message': message,
+        'accounts_checked': attempts,
+        'retry': True,
+        'details': skipped_reasons[-3:]
+    }), 503 if timed_out else 400
 
 #--------------------------------------------------------------
 

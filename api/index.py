@@ -286,6 +286,11 @@ def check_premium_status(user_id):
         logger.error(f"Error checking premium status: {e}")
         return False
 
+
+def has_premium_access(user_id):
+    """Premium features are available to paid users and super administrators."""
+    return check_premium_status(user_id) or is_super_admin(user_id)
+
 def decode_unicode(text):
     if not text or not isinstance(text, str):
         return text
@@ -1121,7 +1126,7 @@ def check_cookie(user):
                 "message": account_info.get('err', 'Invalid account')
             })
         
-        is_premium_user = check_premium_status(user.id)
+        is_premium_user = has_premium_access(user.id)
         is_admin = is_super_admin(user.id)
         
         is_ph_premium = (account_info["country"] == "PH" and 
@@ -1234,7 +1239,7 @@ def batch_check(user):
         if not files:
             return jsonify({'status': 'error', 'message': 'No files provided'}), 400
         
-        is_premium_user = check_premium_status(user.id)
+        is_premium_user = has_premium_access(user.id)
         
         if mode == 'generate_token' and not is_premium_user:
             return jsonify({
@@ -1429,7 +1434,7 @@ def get_accounts(user):
         return response, 204
         
     try:
-        is_premium = check_premium_status(user.id)
+        is_premium = has_premium_access(user.id)
         is_admin = is_super_admin(user.id)
         
         logger.info(f"User {user.id} accessing accounts. Premium: {is_premium}, Admin: {is_admin}")
@@ -1588,7 +1593,7 @@ def generate_account_token(user, account_id):
         return response, 204
         
     try:
-        is_premium = check_premium_status(user.id)
+        is_premium = has_premium_access(user.id)
         
         if not is_premium:
             return jsonify({

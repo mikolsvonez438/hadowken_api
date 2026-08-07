@@ -1716,6 +1716,28 @@ def cron_validate_accounts():
             return jsonify({'status': 'unauthorized'}), 401
 
     try:
+        try:
+            requested_batch_size = int(
+                request.args.get('batch_size', os.environ.get('CRON_BATCH_SIZE', '20'))
+            )
+        except (TypeError, ValueError):
+            return jsonify({'status': 'error', 'message': 'batch_size must be an integer'}), 400
+
+        batch_size = max(1, min(requested_batch_size, 50))
+        cycle_started_at = request.args.get('cycle_started_at')
+        cycle_filter = None
+        if cycle_started_at:
+            try:
+                parsed_cycle = datetime.fromisoformat(cycle_started_at.replace('Z', '+00:00'))
+                if parsed_cycle.tzinfo is None:
+                    parsed_cycle = parsed_cycle.replace(tzinfo=timezone.utc)
+                cycle_filter = parsed_cycle.astimezone(timezone.utc).isoformat()
+            except ValueError:
+                return jsonify({
+                    'status': 'error',
+                    'message': 'cycle_started_at must be a valid ISO-8601 timestamp'
+                }), 400
+
         headers = {
             'apikey': SUPABASE_SERVICE_KEY,
             'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
@@ -1724,31 +1746,39 @@ def cron_validate_accounts():
         }
 
         # Recheck inactive records too; otherwise a temporarily failed account can never recover.
-        accounts = []
-        page_size = 1000
-        offset = 0
-        while True:
-            fetch_url = (
-                f"{SUPABASE_URL}/rest/v1/netflix_accounts"
-                "?select=id,netflix_id,secure_netflix_id,is_active,is_expired,last_checked"
-                "&order=last_checked.asc.nullsfirst"
-                f"&limit={page_size}&offset={offset}"
-            )
-            fetch_resp = requests.get(fetch_url, headers=headers, timeout=30)
-            if fetch_resp.status_code != 200:
-                return jsonify({
-                    'status': 'error',
-                    'message': f'Fetch failed: {fetch_resp.status_code} {fetch_resp.text[:200]}'
-                }), 500
+        # Scheduled calls only pick records due for a daily check. Manual full-cycle
+        # calls pass one stable cycle timestamp and work through every older record.
+        selection_before = cycle_filter or (
+            datetime.now(timezone.utc) - timedelta(hours=24)
+        ).isoformat()
+        query_params = {
+            'select': 'id,netflix_id,secure_netflix_id,is_active,is_expired,last_checked',
+            'order': 'last_checked.asc.nullsfirst',
+            'limit': str(batch_size),
+            'or': f'(last_checked.is.null,last_checked.lt.{selection_before})'
+        }
 
-            page = fetch_resp.json()
-            accounts.extend(page)
-            if len(page) < page_size:
-                break
-            offset += page_size
+        fetch_url = (
+            f"{SUPABASE_URL}/rest/v1/netflix_accounts?"
+            f"{urllib.parse.urlencode(query_params)}"
+        )
+        fetch_resp = requests.get(fetch_url, headers=headers, timeout=30)
+        if fetch_resp.status_code != 200:
+            return jsonify({
+                'status': 'error',
+                'message': f'Fetch failed: {fetch_resp.status_code} {fetch_resp.text[:200]}'
+            }), 500
+
+        accounts = fetch_resp.json()
 
         if not accounts:
-            return jsonify({'status': 'success', 'message': 'No accounts to check', 'checked': 0})
+            return jsonify({
+                'status': 'success',
+                'message': 'No accounts to check',
+                'checked': 0,
+                'batch_size': batch_size,
+                'has_more': False
+            })
 
         results = {
             'working': 0,
@@ -1814,6 +1844,10 @@ def cron_validate_accounts():
         return jsonify({
             'status': 'success' if not results['errors'] else 'partial_success',
             'checked': len(accounts),
+            'batch_size': batch_size,
+            'has_more': len(accounts) == batch_size,
+            'cycle_started_at': cycle_filter,
+            'selection_before': selection_before,
             'results': results
         })
     except Exception as exc:

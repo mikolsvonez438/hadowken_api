@@ -29,6 +29,7 @@ from marshmallow import Schema, fields, validate, ValidationError
 from bs4 import BeautifulSoup
 import random
 import string
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 load_dotenv()
 urllib3.disable_warnings(InsecureRequestWarning)
@@ -96,6 +97,46 @@ if missing:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 translator = GoogleTranslator(source='auto', target='en')
+
+
+def create_auth_client():
+    """Create a request-scoped auth client so user sessions cannot leak between requests."""
+    return create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+
+def get_user_profile(user):
+    """Return the public profile fields used by the frontend."""
+    try:
+        profile_response = supabase.table('user_profiles')\
+            .select('*').eq('id', str(user.id)).single().execute()
+        profile = profile_response.data or {}
+    except Exception as exc:
+        logger.warning(f"Profile lookup failed for {user.id}: {exc}")
+        profile = {}
+
+    email = user.email or ''
+    is_admin = (
+        email in SUPER_ADMIN_EMAILS or
+        str(user.id) in SUPER_ADMIN_IDS or
+        profile.get('is_super_admin', False) or
+        profile.get('role') == 'super_admin'
+    )
+
+    return {
+        'id': user.id,
+        'email': email,
+        'is_premium': profile.get('is_premium', False),
+        'is_super_admin': is_admin,
+        'role': 'super_admin' if is_admin else profile.get('role', 'user')
+    }, profile
+
+
+def serialize_session(session):
+    return {
+        'access_token': session.access_token,
+        'refresh_token': session.refresh_token,
+        'expires_at': session.expires_at
+    }
 
 # =============================================================================
 # ALL HELPER FUNCTIONS AND DECORATORS (DEFINED BEFORE USE)
@@ -864,7 +905,7 @@ def signup():
         if not email or not password:
             return jsonify({'status': 'error', 'message': 'Email and password required'})
         
-        auth_response = supabase.auth.sign_up({
+        auth_response = create_auth_client().auth.sign_up({
             "email": email,
             "password": password
         })
@@ -902,42 +943,61 @@ def login():
         if not email or not password:
             return jsonify({'status': 'error', 'message': 'Email and password required'})
         
-        auth_response = supabase.auth.sign_in_with_password({
+        auth_client = create_auth_client()
+        auth_response = auth_client.auth.sign_in_with_password({
             "email": email,
             "password": password
         })
-        
-        profile = supabase.table('user_profiles').select('*').eq('id', auth_response.user.id).single().execute()
-        
-        is_admin = (email in SUPER_ADMIN_EMAILS or 
-                   str(auth_response.user.id) in SUPER_ADMIN_IDS or
-                   profile.data.get('is_super_admin', False))
-        
-        if is_admin and not profile.data.get('is_super_admin', False):
+
+        user_data, profile = get_user_profile(auth_response.user)
+        is_admin = user_data['is_super_admin']
+
+        if is_admin and not profile.get('is_super_admin', False):
             supabase.table('user_profiles').update({
                 'is_super_admin': True,
                 'role': 'super_admin'
             }).eq('id', auth_response.user.id).execute()
-        
+
         return jsonify({
             'status': 'success',
-            'session': {
-                'access_token': auth_response.session.access_token,
-                'refresh_token': auth_response.session.refresh_token,
-                'expires_at': auth_response.session.expires_at
-            },
-            'user': {
-                'id': auth_response.user.id,
-                'email': auth_response.user.email,
-                'is_premium': profile.data.get('is_premium', False),
-                'is_super_admin': is_admin,
-                'role': 'super_admin' if is_admin else profile.data.get('role', 'user')
-            }
+            'session': serialize_session(auth_response.session),
+            'user': user_data
         })
     except AuthApiError as e:
         return jsonify({'status': 'error', 'message': 'Invalid credentials'})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/api/auth/refresh', methods=['POST', 'OPTIONS'])
+@cross_origin(supports_credentials=True)
+@limiter.limit("20 per minute")
+def refresh_auth_session():
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    try:
+        data = request.get_json(silent=True) or {}
+        refresh_token = data.get('refresh_token', '')
+        if not refresh_token or len(refresh_token) > 4096:
+            return jsonify({'status': 'error', 'message': 'Refresh token required'}), 400
+
+        auth_client = create_auth_client()
+        auth_response = auth_client.auth.refresh_session(refresh_token)
+        if not auth_response.session or not auth_response.user:
+            return jsonify({'status': 'error', 'message': 'Unable to refresh session'}), 401
+
+        user_data, _ = get_user_profile(auth_response.user)
+        return jsonify({
+            'status': 'success',
+            'session': serialize_session(auth_response.session),
+            'user': user_data
+        })
+    except AuthApiError:
+        return jsonify({'status': 'error', 'message': 'Session expired. Please log in again.'}), 401
+    except Exception as exc:
+        logger.error(f"Session refresh failed: {exc}")
+        return jsonify({'status': 'error', 'message': 'Auth service temporarily unavailable'}), 503
+
 
 @app.route('/api/auth/logout', methods=['POST', 'OPTIONS'])
 @cross_origin(supports_credentials=True)
@@ -948,11 +1008,9 @@ def logout(user):
         response.headers.add('Access-Control-Max-Age', '86400')
         return response, 204
         
-    try:
-        supabase.auth.sign_out()
-        return jsonify({'status': 'success', 'message': 'Logged out successfully'})
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)})
+    # The API is stateless. The browser removes its access and refresh tokens.
+    # Avoid signing out the shared service-role client, which may serve other users.
+    return jsonify({'status': 'success', 'message': 'Logged out successfully'})
 
 @app.route('/api/auth/me', methods=['GET', 'OPTIONS'])
 @cross_origin(supports_credentials=True)
@@ -964,14 +1022,10 @@ def get_current_user(user):
         return response, 204
         
     try:
-        profile = supabase.table('user_profiles').select('*').eq('id', user.id).single().execute()
+        user_data, _ = get_user_profile(user)
         return jsonify({
             'status': 'success',
-            'user': {
-                'id': user.id,
-                'email': user.email,
-                'is_premium': profile.data.get('is_premium', False) if profile.data else False
-            }
+            'user': user_data
         })
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
@@ -1387,8 +1441,13 @@ def get_accounts(user):
             }), 403
         
         # SAME FILTER FOR EVERYONE: only active, premium, non-expired accounts
+        account_fields = (
+            'id,email,subscription_type,country,plan,created_at,last_checked,'
+            'secure_netflix_id,days_until_billing,next_billing_date,'
+            'exclusive_access,reserved_for_super_admin,is_expired,added_by'
+        )
         query = supabase.table('netflix_accounts')\
-            .select('*')\
+            .select(account_fields)\
             .eq('is_active', True)\
             .eq('is_premium', True)\
             .eq('is_expired', False)\
@@ -1419,7 +1478,8 @@ def get_accounts(user):
                 'plan': acc['plan'],
                 'created_at': acc['created_at'],
                 'last_checked': acc['last_checked'],
-                'secure_netflix_id': acc['secure_netflix_id'],
+                # The UI only needs availability, never the credential itself.
+                'secure_netflix_id': bool(acc.get('secure_netflix_id')),
                 'days_until_billing': days_left,
                 'next_billing_date': acc.get('next_billing_date')
             }
@@ -1456,7 +1516,10 @@ def get_exclusive_accounts(user):
     
     try:
         accounts = supabase.table('netflix_accounts')\
-            .select('*')\
+            .select(
+                'id,email,subscription_type,country,plan,exclusive_access,'
+                'reserved_for_super_admin,is_active,created_at,last_checked'
+            )\
             .or_('exclusive_access.eq.true,reserved_for_super_admin.eq.true')\
             .eq('is_active', True)\
             .order('created_at', desc=True)\
@@ -1593,20 +1656,65 @@ def health():
         }
     })
 
+ACCOUNT_HEALTH_FIELDS = {
+    'validation_status', 'last_validation_error', 'consecutive_failures'
+}
+
+
+def classify_account_health(account_info):
+    """Classify a validation result without treating temporary network errors as dead."""
+    if account_info.get('ok', False):
+        if not account_info.get('email') or account_info.get('email') == 'Unknown':
+            return 'dead', 'Incomplete account data'
+        return 'working', None
+
+    default_reason = 'Billing date has passed' if account_info.get('is_expired') else 'Unknown validation error'
+    reason = str(account_info.get('err') or default_reason)
+    normalized = reason.lower()
+    transient_terms = ('timeout', 'timed out', 'connection', 'dns', 'ssl', 'temporary', 'rate limit')
+    expired_terms = ('payment', 'billing', 'cancel', 'inactive', 'on hold', 'restart', 'membership expired')
+
+    if any(term in normalized for term in transient_terms):
+        return 'unknown', reason
+    if account_info.get('is_expired') or any(term in normalized for term in expired_terms):
+        return 'expired', reason
+    return 'dead', reason
+
+
+def patch_account_health(account_id, update_data, headers):
+    """Update new health fields, with a safe fallback before the SQL migration is applied."""
+    update_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?id=eq.{account_id}"
+    response = requests.patch(update_url, headers=headers, json=update_data, timeout=30)
+    if response.status_code in (200, 204):
+        return
+
+    legacy_data = {key: value for key, value in update_data.items() if key not in ACCOUNT_HEALTH_FIELDS}
+    fallback = requests.patch(update_url, headers=headers, json=legacy_data, timeout=30)
+    if fallback.status_code not in (200, 204):
+        raise RuntimeError(f"Database update failed ({fallback.status_code}): {fallback.text[:200]}")
+
+
+def validate_stored_account(account):
+    netflix_id = account.get('netflix_id')
+    if not netflix_id:
+        return account, {'ok': False, 'err': 'Missing NetflixId'}
+
+    cookie_data = {'NetflixId': netflix_id}
+    if account.get('secure_netflix_id'):
+        cookie_data['SecureNetflixId'] = account['secure_netflix_id']
+    return account, check_netflix_cookie(cookie_data)
+
+
 @app.route('/api/cron/validate-accounts', methods=['GET', 'POST'])
 def cron_validate_accounts():
-    cron_secret = os.environ.get('CRON_SECRET')
-    auth_header = request.headers.get('Authorization', '')
-    
-    is_vercel = (
-        request.headers.get('User-Agent') == 'Vercel Cron' or
-        (cron_secret and auth_header == f"Bearer {cron_secret}") or
-        request.headers.get('x-vercel-signature') is not None
-    )
-    
-    if not is_vercel and os.environ.get('VERCEL_ENV') == 'production':
-        return jsonify({'status': 'unauthorized'}), 401
-    
+    cron_secret = os.environ.get('CRON_SECRET', '')
+    expected_auth = f"Bearer {cron_secret}"
+    supplied_auth = request.headers.get('Authorization', '')
+
+    if os.environ.get('VERCEL_ENV') == 'production':
+        if not cron_secret or not secrets.compare_digest(supplied_auth, expected_auth):
+            return jsonify({'status': 'unauthorized'}), 401
+
     try:
         headers = {
             'apikey': SUPABASE_SERVICE_KEY,
@@ -1614,95 +1722,103 @@ def cron_validate_accounts():
             'Content-Type': 'application/json',
             'Prefer': 'return=minimal'
         }
-        
-        fetch_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?select=*&is_active=eq.true"
-        fetch_resp = requests.get(fetch_url, headers=headers, timeout=30)
-        
-        if fetch_resp.status_code != 200:
-            return jsonify({'status': 'error', 'message': f'Fetch failed: {fetch_resp.status_code}'}), 500
-        
-        accounts = fetch_resp.json()
-        
+
+        # Recheck inactive records too; otherwise a temporarily failed account can never recover.
+        accounts = []
+        page_size = 1000
+        offset = 0
+        while True:
+            fetch_url = (
+                f"{SUPABASE_URL}/rest/v1/netflix_accounts"
+                "?select=id,netflix_id,secure_netflix_id,is_active,is_expired,last_checked"
+                "&order=last_checked.asc.nullsfirst"
+                f"&limit={page_size}&offset={offset}"
+            )
+            fetch_resp = requests.get(fetch_url, headers=headers, timeout=30)
+            if fetch_resp.status_code != 200:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Fetch failed: {fetch_resp.status_code} {fetch_resp.text[:200]}'
+                }), 500
+
+            page = fetch_resp.json()
+            accounts.extend(page)
+            if len(page) < page_size:
+                break
+            offset += page_size
+
         if not accounts:
             return jsonify({'status': 'success', 'message': 'No accounts to check', 'checked': 0})
-        
-        results = {'valid': 0, 'invalid': 0, 'updated': 0, 'errors': []}
-        
-        for account in accounts:
-            try:
-                netflix_id = account.get('netflix_id')
-                if not netflix_id:
-                    continue
-                
-                account_info = check_netflix_cookie({"NetflixId": netflix_id})
-                
-                # CRITICAL FIX: Same validation logic as bulk recheck
-                is_valid = account_info.get('ok', False)
-                error_reason = account_info.get('err', 'Unknown error')
-                
-                # Safety checks
-                if is_valid and (not account_info.get('email') or account_info.get('email') == 'Unknown'):
-                    is_valid = False
-                    error_reason = 'Incomplete account data'
-                
-                if is_valid and account_info.get('plan') == 'Unknown' and not account_info.get('premium', False):
-                    is_valid = False
-                    error_reason = 'Unknown plan, likely expired'
-                
-                if is_valid:
+
+        results = {
+            'working': 0,
+            'expired': 0,
+            'dead': 0,
+            'unknown': 0,
+            'updated': 0,
+            'errors': []
+        }
+        max_workers = max(1, min(int(os.environ.get('CRON_MAX_WORKERS', '4')), 8))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(validate_stored_account, account): account['id']
+                for account in accounts
+            }
+
+            for future in as_completed(future_map):
+                account_id = future_map[future]
+                try:
+                    account, account_info = future.result()
+                    health_status, error_reason = classify_account_health(account_info)
+                    now = datetime.now(timezone.utc).isoformat()
+
                     update_data = {
-                        'last_checked': datetime.utcnow().isoformat(),
-                        'plan': account_info['plan'],
-                        'subscription_type': account_info['subscription_type'],
-                        'country': account_info['country'],
-                        'is_active': True,
-                        'is_premium': account_info['premium'],
-                        'next_billing_date': account_info.get('next_billing_date'),
-                        'days_until_billing': account_info.get('days_until_billing'),
-                        'is_expired': False,
-                        'deactivated_reason': None,
-                        'deactivated_at': None
+                        'last_checked': now,
+                        'validation_status': health_status,
+                        'last_validation_error': error_reason,
+                        'consecutive_failures': 0 if health_status == 'working' else 1
                     }
-                    
-                    update_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?id=eq.{account['id']}"
-                    requests.patch(update_url, headers=headers, json=update_data, timeout=30)
-                    
-                    results['valid'] += 1
+
+                    if health_status == 'working':
+                        update_data.update({
+                            'plan': account_info.get('plan', 'Unknown'),
+                            'subscription_type': account_info.get('subscription_type', 'Unknown'),
+                            'country': account_info.get('country', 'Unknown'),
+                            'is_active': True,
+                            'is_premium': account_info.get('premium', False),
+                            'next_billing_date': account_info.get('next_billing_date'),
+                            'days_until_billing': account_info.get('days_until_billing'),
+                            'is_expired': False,
+                            'deactivated_reason': None,
+                            'deactivated_at': None
+                        })
+                    elif health_status in ('expired', 'dead'):
+                        update_data.update({
+                            'is_active': False,
+                            'is_premium': False,
+                            'is_expired': health_status == 'expired',
+                            'deactivated_reason': error_reason,
+                            'deactivated_at': now
+                        })
+                    # For an unknown/network result, preserve the previous active state.
+
+                    patch_account_health(account['id'], update_data, headers)
+                    results[health_status] += 1
                     results['updated'] += 1
-                    
-                else:
-                    update_data = {
-                        'is_active': False,
-                        'last_checked': datetime.utcnow().isoformat(),
-                        'deactivated_reason': error_reason,
-                        'deactivated_at': datetime.utcnow().isoformat(),
-                        'is_expired': True,
-                        'is_premium': False
-                    }
-                    
-                    update_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?id=eq.{account['id']}"
-                    requests.patch(update_url, headers=headers, json=update_data, timeout=30)
-                    
-                    results['invalid'] += 1
-                    
-                time.sleep(1.5)
-                
-            except Exception as e:
-                results['errors'].append({'account_id': account['id'], 'error': str(e)})
-                logger.error(f"Error checking account {account['id']}: {e}")
-                continue
-        
+                except Exception as exc:
+                    logger.error(f"Error checking account {account_id}: {exc}")
+                    if len(results['errors']) < 20:
+                        results['errors'].append({'account_id': account_id, 'error': str(exc)})
+
         return jsonify({
-            'status': 'success',
+            'status': 'success' if not results['errors'] else 'partial_success',
             'checked': len(accounts),
             'results': results
         })
-        
-    except Exception as e:
-        logger.error(f"Cron job failed: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+    except Exception as exc:
+        logger.exception("Cron job failed")
+        return jsonify({'status': 'error', 'message': str(exc)}), 500
 
 @app.route('/api/admin/bulk-recheck', methods=['POST', 'OPTIONS'])
 @cross_origin(supports_credentials=True)

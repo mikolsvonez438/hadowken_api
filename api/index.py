@@ -1567,18 +1567,35 @@ def get_exclusive_accounts(user):
         return '', 204
     
     try:
-        accounts = supabase.table('netflix_accounts')\
-            .select(
-                'id,email,subscription_type,country,plan,exclusive_access,'
-                'reserved_for_super_admin,is_active,created_at,last_checked'
-            )\
-            .or_('exclusive_access.eq.true,reserved_for_super_admin.eq.true')\
-            .eq('is_active', True)\
-            .order('created_at', desc=True)\
-            .execute()
+        fields = (
+            'id,email,subscription_type,country,plan,exclusive_access,'
+            'reserved_for_super_admin,is_active,created_at,last_checked'
+        )
+        query = urllib.parse.urlencode({
+            'select': fields,
+            'or': '(exclusive_access.eq.true,reserved_for_super_admin.eq.true)',
+            'is_active': 'eq.true',
+            'order': 'created_at.desc',
+            'limit': '1000'
+        })
+        response = requests.get(
+            f"{SUPABASE_URL}/rest/v1/netflix_accounts?{query}",
+            headers={
+                'apikey': SUPABASE_SERVICE_KEY,
+                'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}'
+            },
+            timeout=30
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Exclusive account query failed ({response.status_code}): "
+                f"{response.text[:200]}"
+            )
+
+        account_rows = response.json()
         
-        ph_accounts = [a for a in (accounts.data or []) if a.get('country') == 'PH']
-        other_accounts = [a for a in (accounts.data or []) if a.get('country') != 'PH']
+        ph_accounts = [a for a in account_rows if a.get('country') == 'PH']
+        other_accounts = [a for a in account_rows if a.get('country') != 'PH']
         
         return jsonify({
             "status": "success",
@@ -1593,7 +1610,10 @@ def get_exclusive_accounts(user):
         
     except Exception as e:
         logger.error(f"Error getting exclusive accounts: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({
+            "status": "error",
+            "message": "Failed to load exclusive accounts"
+        }), 500
 
 @app.route('/api/accounts/<account_id>/set-exclusive', methods=['POST', 'OPTIONS'])
 @cross_origin(supports_credentials=True)

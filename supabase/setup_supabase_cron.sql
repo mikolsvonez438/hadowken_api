@@ -1,35 +1,78 @@
--- OPTIONAL ALTERNATIVE TO VERCEL CRON
--- Run this only if you prefer Supabase Database Cron. Do not enable both schedulers.
--- Before running, replace REPLACE_WITH_THE_SAME_CRON_SECRET_USED_IN_VERCEL.
+-- BATCHED SUPABASE DATABASE CRON
+-- Replace the placeholder below with the exact CRON_SECRET from backend Vercel.
+-- This script is safe to rerun: it updates the Vault entries and replaces the job.
 
 create extension if not exists pg_cron;
 create extension if not exists pg_net;
 create extension if not exists supabase_vault;
 
-select vault.create_secret(
-  'https://hadowken-api.vercel.app/api/cron/validate-accounts',
-  'account_validation_api_url',
-  'Backend endpoint called by the account health cron'
-);
+do $$
+declare
+  existing_id uuid;
+begin
+  select id into existing_id
+  from vault.secrets
+  where name = 'account_validation_api_url'
+  order by created_at desc
+  limit 1;
 
-select vault.create_secret(
-  'REPLACE_WITH_THE_SAME_CRON_SECRET_USED_IN_VERCEL',
-  'account_validation_cron_secret',
-  'Bearer token used by the account health cron'
-);
+  if existing_id is null then
+    perform vault.create_secret(
+      'https://hadowken-api.vercel.app/api/cron/validate-accounts',
+      'account_validation_api_url',
+      'Backend endpoint called by the account health cron'
+    );
+  else
+    perform vault.update_secret(
+      existing_id,
+      'https://hadowken-api.vercel.app/api/cron/validate-accounts',
+      'account_validation_api_url',
+      'Backend endpoint called by the account health cron'
+    );
+  end if;
+
+  select id into existing_id
+  from vault.secrets
+  where name = 'account_validation_cron_secret'
+  order by created_at desc
+  limit 1;
+
+  if existing_id is null then
+    perform vault.create_secret(
+      'REPLACE_WITH_THE_SAME_CRON_SECRET_USED_IN_VERCEL',
+      'account_validation_cron_secret',
+      'Bearer token used by the account health cron'
+    );
+  else
+    perform vault.update_secret(
+      existing_id,
+      'REPLACE_WITH_THE_SAME_CRON_SECRET_USED_IN_VERCEL',
+      'account_validation_cron_secret',
+      'Bearer token used by the account health cron'
+    );
+  end if;
+end
+$$;
 
 do $$
 begin
   perform cron.unschedule('daily-netflix-account-validation');
-exception
-  when others then null;
+exception when others then null;
 end
 $$;
 
--- 16:00 UTC is midnight in Asia/Manila (UTC+8).
+do $$
+begin
+  perform cron.unschedule('hourly-netflix-account-validation');
+exception when others then null;
+end
+$$;
+
+-- Every hour, validate up to 20 records whose last check is at least 24 hours old.
+-- Recently checked records are skipped, avoiding unnecessary repeated validation.
 select cron.schedule(
-  'daily-netflix-account-validation',
-  '0 16 * * *',
+  'hourly-netflix-account-validation',
+  '0 * * * *',
   $job$
     select net.http_get(
       url := (
@@ -48,7 +91,7 @@ select cron.schedule(
           limit 1
         )
       ),
-      timeout_milliseconds := 300000
+      timeout_milliseconds := 240000
     ) as request_id;
   $job$
 );

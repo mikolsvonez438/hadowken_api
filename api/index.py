@@ -1724,6 +1724,9 @@ def cron_validate_accounts():
             return jsonify({'status': 'error', 'message': 'batch_size must be an integer'}), 400
 
         batch_size = max(1, min(requested_batch_size, 50))
+        include_inactive = request.args.get('include_inactive', 'false').lower() in (
+            '1', 'true', 'yes'
+        )
         cycle_started_at = request.args.get('cycle_started_at')
         cycle_filter = None
         if cycle_started_at:
@@ -1757,6 +1760,10 @@ def cron_validate_accounts():
             'limit': str(batch_size),
             'or': f'(last_checked.is.null,last_checked.lt.{selection_before})'
         }
+        if not include_inactive:
+            # Expired and dead records are deactivated when classified, so scheduled
+            # validation only spends time on accounts that may still be working.
+            query_params['is_active'] = 'eq.true'
 
         fetch_url = (
             f"{SUPABASE_URL}/rest/v1/netflix_accounts?"
@@ -1777,7 +1784,8 @@ def cron_validate_accounts():
                 'message': 'No accounts to check',
                 'checked': 0,
                 'batch_size': batch_size,
-                'has_more': False
+                'has_more': False,
+                'include_inactive': include_inactive
             })
 
         results = {
@@ -1848,6 +1856,7 @@ def cron_validate_accounts():
             'has_more': len(accounts) == batch_size,
             'cycle_started_at': cycle_filter,
             'selection_before': selection_before,
+            'include_inactive': include_inactive,
             'results': results
         })
     except Exception as exc:

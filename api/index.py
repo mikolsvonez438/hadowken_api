@@ -138,6 +138,45 @@ def serialize_session(session):
         'expires_at': session.expires_at
     }
 
+
+DEFAULT_ADS_SUPPORTED_COUNTRIES = {
+    'AU', 'BR', 'CA', 'FR', 'DE', 'IT', 'JP', 'KR', 'MX', 'ES', 'GB', 'US'
+}
+
+
+def get_ads_supported_countries():
+    configured = os.environ.get('NETFLIX_ADS_SUPPORTED_COUNTRIES', '')
+    if not configured.strip():
+        return DEFAULT_ADS_SUPPORTED_COUNTRIES
+    return {country.strip().upper() for country in configured.split(',') if country.strip()}
+
+
+def is_ad_supported_plan(*plan_values):
+    combined = ' '.join(str(value or '') for value in plan_values).lower()
+    ad_free_terms = ('ad-free', 'without ads', 'sin anuncios', 'sans pub', 'senza pubblicità')
+    if any(term in combined for term in ad_free_terms):
+        return False
+    ad_terms = (
+        'with ads', 'ad-supported', 'with adverts', 'con anuncios',
+        'com anúncios', 'avec pub', 'avec publicité', 'mit werbung',
+        'con pubblicità', '広告つき', '광고형'
+    )
+    return any(term in combined for term in ad_terms)
+
+
+def get_viewer_country():
+    country = request.headers.get('x-vercel-ip-country', '').strip().upper()
+    return country if re.fullmatch(r'[A-Z]{2}', country) else None
+
+
+def get_region_compatibility(plan, subscription_type, viewer_country):
+    is_ad_plan = is_ad_supported_plan(plan, subscription_type)
+    compatible = (
+        None if is_ad_plan and not viewer_country
+        else (not is_ad_plan or viewer_country in get_ads_supported_countries())
+    )
+    return is_ad_plan, compatible
+
 # =============================================================================
 # ALL HELPER FUNCTIONS AND DECORATORS (DEFINED BEFORE USE)
 # =============================================================================
@@ -1469,12 +1508,16 @@ def get_accounts(user):
             logger.info(f"Super admin {user.id} accessed accounts. PH pool: {ph_count}")
         
         safe_accounts = []
+        viewer_country = get_viewer_country()
         for acc in accounts.data or []:
             # Extra safety: skip anything that slipped through with negative billing
             days_left = acc.get('days_until_billing')
             if days_left is not None and days_left < -3:
                 continue
             
+            is_ad_plan, region_compatible = get_region_compatibility(
+                acc.get('plan'), acc.get('subscription_type'), viewer_country
+            )
             account_data = {
                 'id': acc['id'],
                 'email': acc['email'],
@@ -1486,7 +1529,10 @@ def get_accounts(user):
                 # The UI only needs availability, never the credential itself.
                 'secure_netflix_id': bool(acc.get('secure_netflix_id')),
                 'days_until_billing': days_left,
-                'next_billing_date': acc.get('next_billing_date')
+                'next_billing_date': acc.get('next_billing_date'),
+                'is_ad_supported_plan': is_ad_plan,
+                'region_compatible': region_compatible,
+                'viewer_country': viewer_country
             }
             
             # Admins see extra metadata (but same filtered accounts)
@@ -1502,6 +1548,7 @@ def get_accounts(user):
             "status": "success",
             "accounts": safe_accounts,
             "is_super_admin": is_admin,
+            "viewer_country": viewer_country,
             "total_count": len(safe_accounts)
         })
         
@@ -1613,6 +1660,23 @@ def generate_account_token(user, account_id):
                 "status": "error",
                 "message": "Account not found"
             }), 404
+
+        viewer_country = get_viewer_country()
+        is_ad_plan, region_compatible = get_region_compatibility(
+            account.data.get('plan'),
+            account.data.get('subscription_type'),
+            viewer_country
+        )
+        if is_ad_plan and region_compatible is False:
+            return jsonify({
+                "status": "error",
+                "code": "AD_PLAN_REGION_RESTRICTED",
+                "message": (
+                    f"This is an ad-supported plan and it is not available in "
+                    f"your current region ({viewer_country}). Choose an ad-free account."
+                ),
+                "viewer_country": viewer_country
+            }), 409
         
         netflix_id = account.data.get('netflix_id')
         

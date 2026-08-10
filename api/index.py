@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_from_directory, make_response, stream_with_context, Response, g
+from flask import Flask, request, jsonify, send_from_directory, make_response, stream_with_context, Response, g, redirect
 from flask_cors import CORS, cross_origin
 from functools import wraps
 import os
@@ -1865,6 +1865,61 @@ def _telegram_tv_login(code, database_user_id, chat_id, message_id, ip_address):
     return False, f'No usable account was found after {attempts} prioritized attempt(s). Last result: {reason}'
 
 
+def _telegram_create_short_login_urls(token_result, database_user_id, base_url):
+    """Store the long Netflix token server-side and return copy-button-safe URLs."""
+    token = str((token_result or {}).get('token') or '')
+    if not token:
+        return None
+    try:
+        expires_epoch = int((token_result or {}).get('expires') or 0)
+        expires_at = datetime.fromtimestamp(expires_epoch, timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    if expires_at <= datetime.now(timezone.utc):
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    headers = {
+        'apikey': SUPABASE_SERVICE_KEY,
+        'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
+        'Content-Type': 'application/json',
+        'Prefer': 'return=minimal'
+    }
+    try:
+        # Opportunistic cleanup keeps the short-link table small without another cron.
+        requests.delete(
+            f'{SUPABASE_URL}/rest/v1/telegram_short_links',
+            params={'expires_at': f'lt.{datetime.now(timezone.utc).isoformat()}'},
+            headers=headers,
+            timeout=5
+        )
+        for _ in range(3):
+            code = secrets.token_urlsafe(18)
+            response = requests.post(
+                f'{SUPABASE_URL}/rest/v1/telegram_short_links',
+                headers=headers,
+                json={
+                    'code': code,
+                    'nftoken': token,
+                    'created_by': str(database_user_id),
+                    'expires_at': expires_at.isoformat()
+                },
+                timeout=15
+            )
+            if response.status_code == 201:
+                origin = str(base_url or '').rstrip('/')
+                return {
+                    'phone': f'{origin}/t/{code}/phone',
+                    'tv': f'{origin}/t/{code}/tv',
+                    'pc': f'{origin}/t/{code}/pc'
+                }
+            if response.status_code != 409:
+                logger.error(f'Telegram short-link insert failed: HTTP {response.status_code}')
+                break
+    except Exception as exc:
+        logger.error(f'Telegram short-link creation failed: {exc}')
+    return None
+
+
 def _telegram_login_copy_keyboard(urls):
     buttons = []
     for label, key in (
@@ -1881,7 +1936,48 @@ def _telegram_login_copy_keyboard(urls):
     return {'inline_keyboard': [buttons[:2], buttons[2:]] if len(buttons) > 2 else [buttons]}
 
 
-def _telegram_random_account(database_user_id, chat_id, message_id, ip_address):
+@app.route('/t/<code>/<device>', methods=['GET'])
+def telegram_short_login_redirect(code, device):
+    """Resolve an unguessable, expiring Telegram short link to Netflix."""
+    if not re.fullmatch(r'[A-Za-z0-9_-]{16,64}', code or ''):
+        return Response('Invalid link', status=404, mimetype='text/plain')
+    paths = {'phone': 'unsupported', 'tv': 'tv8', 'pc': 'browse'}
+    netflix_path = paths.get(str(device or '').lower())
+    if not netflix_path:
+        return Response('Invalid device link', status=404, mimetype='text/plain')
+
+    headers = {
+        'apikey': SUPABASE_SERVICE_KEY,
+        'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}'
+    }
+    try:
+        response = requests.get(
+            f'{SUPABASE_URL}/rest/v1/telegram_short_links',
+            params={'select': 'nftoken,expires_at', 'code': f'eq.{code}', 'limit': '1'},
+            headers=headers,
+            timeout=15
+        )
+        if response.status_code != 200 or not response.json():
+            return Response('Link not found', status=404, mimetype='text/plain')
+        record = response.json()[0]
+        expires_at = datetime.fromisoformat(
+            str(record.get('expires_at') or '').replace('Z', '+00:00')
+        )
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= datetime.now(timezone.utc):
+            return Response('This login link has expired', status=410, mimetype='text/plain')
+        token = str(record.get('nftoken') or '')
+        if not token:
+            return Response('Link not found', status=404, mimetype='text/plain')
+        target = f'https://netflix.com/{netflix_path}?nftoken={urllib.parse.quote(token, safe="")}'
+        return redirect(target, code=302)
+    except Exception as exc:
+        logger.error(f'Telegram short-link resolution failed: {exc}')
+        return Response('Unable to resolve this login link', status=500, mimetype='text/plain')
+
+
+def _telegram_random_account(database_user_id, chat_id, message_id, ip_address, base_url):
     try:
         candidates = _telegram_priority_pool()
     except Exception as exc:
@@ -1917,8 +2013,15 @@ def _telegram_random_account(database_user_id, chat_id, message_id, ip_address):
             ip_address=ip_address,
             token=token_result.get('token')
         )
-        urls = token_result.get('login_urls') or {}
-        keyboard = _telegram_login_copy_keyboard(urls)
+        short_urls = _telegram_create_short_login_urls(
+            token_result, database_user_id, base_url
+        )
+        keyboard = _telegram_login_copy_keyboard(short_urls)
+        copy_hint = (
+            '👇 Tap a button below to copy the login link.'
+            if keyboard else
+            '⚠️ Copy buttons could not be created. Run the latest Telegram SQL migration.'
+        )
         return True, (
             '🎟️ RANDOM ACCOUNT READY\n'
             '━━━━━━━━━━━━━━━━━━━━\n'
@@ -1928,7 +2031,7 @@ def _telegram_random_account(database_user_id, chat_id, message_id, ip_address):
             f'🎯 Priority: {tier_label}\n'
             f'🔎 Accounts checked: {attempt}\n'
             '━━━━━━━━━━━━━━━━━━━━\n'
-            '👇 Tap a button below to copy the login link.'
+            f'{copy_hint}'
         ), keyboard
     return False, f'No working account was found after {len(candidates)} prioritized attempt(s).', None
 
@@ -2024,7 +2127,11 @@ def telegram_webhook():
         )
         progress_id = progress.get('message_id') if isinstance(progress, dict) else None
         success, result_message, reply_markup = _telegram_random_account(
-            database_user_id, chat_id, progress_id, request.remote_addr
+            database_user_id,
+            chat_id,
+            progress_id,
+            request.remote_addr,
+            request.url_root.rstrip('/')
         )
         final_text = result_message if success else '❌ RANDOM ACCOUNT FAILED\n\n' + result_message
         if not _telegram_edit(chat_id, progress_id, final_text, reply_markup=reply_markup):

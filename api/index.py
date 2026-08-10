@@ -1423,8 +1423,9 @@ def process_content(content, filename, mode, is_premium_user, user_id):
             "message": account_info.get('err', 'Invalid account')
         }
     
+    stored_in_db = False
     if account_info["ok"] and account_info.get("premium"):
-        store_netflix_account(
+        stored_in_db, _ = store_netflix_account(
             email=account_info["email"],
             netflix_id=netflix_id,
             secure_netflix_id=secure_netflix_id,
@@ -1449,7 +1450,7 @@ def process_content(content, filename, mode, is_premium_user, user_id):
         "is_premium": account_info["premium"],
         "subscription_type": account_info["subscription_type"],
         "mode": mode,
-        "stored_in_db": account_info["ok"] and account_info["premium"]
+        "stored_in_db": stored_in_db
     }
     
     if mode == 'generate_token' and is_premium_user:
@@ -1462,6 +1463,357 @@ def process_content(content, filename, mode, is_premium_user, user_id):
             result_data["token_error"] = token_result.get("error", "Failed")
     
     return result_data
+
+
+# =============================================================================
+# TELEGRAM COOKIE BATCH BOT
+# =============================================================================
+def _telegram_env_int(name, default, minimum, maximum):
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _telegram_allowed_users():
+    allowed = set()
+    for value in os.environ.get('TELEGRAM_ALLOWED_USER_IDS', '').split(','):
+        value = value.strip()
+        if value.lstrip('-').isdigit():
+            allowed.add(int(value))
+    return allowed
+
+
+def _telegram_api(method, payload=None, timeout=20):
+    token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
+    if not token:
+        raise RuntimeError('TELEGRAM_BOT_TOKEN is not configured')
+    response = requests.post(
+        f'https://api.telegram.org/bot{token}/{method}',
+        json=payload or {},
+        timeout=timeout
+    )
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f'Telegram returned HTTP {response.status_code}') from exc
+    if response.status_code != 200 or not data.get('ok'):
+        raise RuntimeError(data.get('description') or f'Telegram API error {response.status_code}')
+    return data.get('result')
+
+
+def _telegram_send(chat_id, text):
+    """Send plain text in chunks without ever including cookie values."""
+    text = str(text or '')
+    chunks = []
+    while text:
+        if len(text) <= 3500:
+            chunks.append(text)
+            break
+        split_at = text.rfind('\n', 0, 3500)
+        if split_at < 1000:
+            split_at = 3500
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip('\n')
+    try:
+        for chunk in chunks or ['']:
+            _telegram_api('sendMessage', {'chat_id': chat_id, 'text': chunk})
+        return True
+    except Exception as exc:
+        logger.error(f'Telegram sendMessage failed: {exc}')
+        return False
+
+
+def _telegram_download_document(document):
+    max_bytes = _telegram_env_int(
+        'TELEGRAM_MAX_UPLOAD_MB', 12, 1, 20
+    ) * 1024 * 1024
+    claimed_size = int(document.get('file_size') or 0)
+    if claimed_size and claimed_size > max_bytes:
+        raise ValueError(f'File is larger than the configured {max_bytes // (1024 * 1024)} MB limit')
+
+    file_info = _telegram_api('getFile', {'file_id': document.get('file_id')})
+    file_path = (file_info or {}).get('file_path')
+    if not file_path:
+        raise RuntimeError('Telegram did not return a downloadable file path')
+
+    token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
+    response = requests.get(
+        f'https://api.telegram.org/file/bot{token}/{file_path}',
+        timeout=60
+    )
+    response.raise_for_status()
+    if len(response.content) > max_bytes:
+        raise ValueError(f'File is larger than the configured {max_bytes // (1024 * 1024)} MB limit')
+    return response.content
+
+
+def _telegram_cookie_files(payload, filename):
+    """Read bounded text cookie files in memory; never extract ZIP paths to disk."""
+    filename = os.path.basename(filename or 'upload.zip')
+    extension = os.path.splitext(filename)[1].lower()
+    if extension in ('.txt', '.json', '.cookies'):
+        return [(filename, payload.decode('utf-8', errors='ignore'))]
+    if extension != '.zip':
+        raise ValueError('Upload a .zip, .txt, .json, or .cookies file')
+
+    max_files = _telegram_env_int('TELEGRAM_MAX_COOKIE_FILES', 25, 1, 50)
+    max_uncompressed = _telegram_env_int(
+        'TELEGRAM_MAX_UNCOMPRESSED_MB', 25, 1, 50
+    ) * 1024 * 1024
+    supported = ('.txt', '.json', '.cookies')
+    extracted = []
+    total_uncompressed = 0
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload), 'r') as archive:
+            entries = [
+                item for item in archive.infolist()
+                if not item.is_dir() and os.path.splitext(item.filename)[1].lower() in supported
+            ]
+            if not entries:
+                raise ValueError('The ZIP contains no supported cookie text files')
+            if len(entries) > max_files:
+                raise ValueError(f'The ZIP contains {len(entries)} cookie files; limit is {max_files}')
+
+            for item in entries:
+                if item.flag_bits & 0x1:
+                    raise ValueError('Encrypted ZIP files are not supported')
+                total_uncompressed += item.file_size
+                if total_uncompressed > max_uncompressed:
+                    raise ValueError('ZIP is too large after decompression')
+                content = archive.read(item).decode('utf-8', errors='ignore')
+                extracted.append((os.path.basename(item.filename), content))
+    except zipfile.BadZipFile as exc:
+        raise ValueError('The uploaded ZIP file is damaged or invalid') from exc
+
+    return extracted
+
+
+def _telegram_claim_update(update_id, telegram_user_id, chat_id, filename):
+    """Deduplicate Telegram retries. If migration is absent, continue with an error log."""
+    headers = {
+        'apikey': SUPABASE_SERVICE_KEY,
+        'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
+        'Content-Type': 'application/json',
+        'Prefer': 'resolution=ignore-duplicates,return=representation'
+    }
+    try:
+        response = requests.post(
+            f'{SUPABASE_URL}/rest/v1/telegram_bot_jobs',
+            params={'on_conflict': 'update_id'},
+            headers=headers,
+            json={
+                'update_id': update_id,
+                'telegram_user_id': telegram_user_id,
+                'chat_id': chat_id,
+                'filename': str(filename or '')[:255],
+                'status': 'processing'
+            },
+            timeout=15
+        )
+        if response.status_code == 201:
+            return bool(response.json())
+        logger.error(f'Telegram job claim failed ({response.status_code}); processing without dedupe')
+    except Exception as exc:
+        logger.error(f'Telegram job claim error; processing without dedupe: {exc}')
+    return True
+
+
+def _telegram_finish_update(update_id, status, summary=None, error=None):
+    try:
+        requests.patch(
+            f'{SUPABASE_URL}/rest/v1/telegram_bot_jobs',
+            params={'update_id': f'eq.{update_id}'},
+            headers={
+                'apikey': SUPABASE_SERVICE_KEY,
+                'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
+                'Content-Type': 'application/json',
+                'Prefer': 'return=minimal'
+            },
+            json={
+                'status': status,
+                'summary': summary,
+                'error': str(error)[:500] if error else None,
+                'completed_at': datetime.now(timezone.utc).isoformat()
+            },
+            timeout=15
+        )
+    except Exception as exc:
+        logger.error(f'Unable to finish Telegram job {update_id}: {exc}')
+
+
+def _telegram_process_upload(payload, filename, database_user_id):
+    files = _telegram_cookie_files(payload, filename)
+    results = []
+    unique_files = []
+    fingerprints = set()
+
+    for entry_name, content in files:
+        credentials = extract_netflix_credentials(content)
+        if not credentials:
+            results.append({
+                'status': 'error',
+                'filename': entry_name,
+                'message': 'No NetflixId found'
+            })
+            continue
+        fingerprint = hashlib.sha256(
+            credentials['netflix_id'].encode('utf-8', errors='ignore')
+        ).hexdigest()
+        if fingerprint in fingerprints:
+            results.append({
+                'status': 'duplicate',
+                'filename': entry_name,
+                'message': 'Duplicate cookie skipped'
+            })
+            continue
+        fingerprints.add(fingerprint)
+        unique_files.append((entry_name, content))
+
+    workers = min(
+        _telegram_env_int('TELEGRAM_MAX_WORKERS', 4, 1, 6),
+        len(unique_files)
+    )
+    if workers:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    process_content, content, entry_name, 'check_only', True, database_user_id
+                ): entry_name
+                for entry_name, content in unique_files
+            }
+            for future in as_completed(futures):
+                entry_name = futures[future]
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    results.append({
+                        'status': 'error',
+                        'filename': entry_name,
+                        'message': str(exc)
+                    })
+    return results
+
+
+def _telegram_results_message(filename, results):
+    valid = [item for item in results if item.get('status') == 'success']
+    saved = [item for item in valid if item.get('stored_in_db')]
+    duplicates = [item for item in results if item.get('status') == 'duplicate']
+    invalid = [item for item in results if item.get('status') == 'error']
+    lines = [
+        'Batch check complete',
+        f'File: {os.path.basename(filename)}',
+        f'Total: {len(results)}',
+        f'Valid: {len(valid)}',
+        f'Saved/updated in database: {len(saved)}',
+        f'Invalid: {len(invalid)}',
+        f'Duplicates skipped: {len(duplicates)}'
+    ]
+
+    if valid:
+        lines.append('\nValid accounts:')
+        for item in valid[:15]:
+            email = str(item.get('email') or 'Unknown').replace('\n', ' ')[:100]
+            country = str(item.get('country') or 'Unknown')[:20]
+            plan = str(item.get('plan') or 'Unknown').replace('\n', ' ')[:80]
+            saved_label = 'saved' if item.get('stored_in_db') else 'not saved'
+            lines.append(f'- {email} | {country} | {plan} | {saved_label}')
+        if len(valid) > 15:
+            lines.append(f'- ...and {len(valid) - 15} more valid account(s)')
+
+    if invalid:
+        lines.append('\nInvalid accounts:')
+        for item in invalid[:10]:
+            entry_name = os.path.basename(str(item.get('filename') or 'Unknown'))[:80]
+            reason = str(item.get('message') or 'Invalid').replace('\n', ' ')[:120]
+            lines.append(f'- {entry_name}: {reason}')
+        if len(invalid) > 10:
+            lines.append(f'- ...and {len(invalid) - 10} more invalid account(s)')
+    return '\n'.join(lines), {
+        'total': len(results),
+        'valid': len(valid),
+        'saved': len(saved),
+        'invalid': len(invalid),
+        'duplicates': len(duplicates)
+    }
+
+
+@app.route('/api/telegram/webhook', methods=['POST'])
+def telegram_webhook():
+    """Receive Telegram updates, validate cookie ZIPs, and store working accounts."""
+    webhook_secret = os.environ.get('TELEGRAM_WEBHOOK_SECRET', '').strip()
+    supplied_secret = request.headers.get('X-Telegram-Bot-Api-Secret-Token', '')
+    if not webhook_secret or not secrets.compare_digest(supplied_secret, webhook_secret):
+        return jsonify({'ok': False}), 401
+
+    update = request.get_json(silent=True) or {}
+    message = update.get('message') or {}
+    chat_id = (message.get('chat') or {}).get('id')
+    telegram_user_id = (message.get('from') or {}).get('id')
+    if not chat_id or telegram_user_id is None:
+        return jsonify({'ok': True})
+
+    if telegram_user_id not in _telegram_allowed_users():
+        _telegram_send(
+            chat_id,
+            f'Access denied. Your Telegram user ID is {telegram_user_id}. '
+            'Add it to TELEGRAM_ALLOWED_USER_IDS in Vercel.'
+        )
+        return jsonify({'ok': True})
+
+    text = str(message.get('text') or '').strip().lower()
+    if text.startswith('/start') or text.startswith('/help'):
+        _telegram_send(
+            chat_id,
+            'Netflix cookie batch bot is ready.\n\n'
+            'Upload a ZIP containing .txt/.json cookie files, or upload one cookie file directly. '
+            'I will validate each unique account and save/update working memberships in Supabase.\n\n'
+            'Commands: /status, /help'
+        )
+        return jsonify({'ok': True})
+    if text.startswith('/status'):
+        _telegram_send(
+            chat_id,
+            'Bot status: ready\n'
+            f'Max cookie files per ZIP: {_telegram_env_int("TELEGRAM_MAX_COOKIE_FILES", 25, 1, 50)}\n'
+            f'Workers: {_telegram_env_int("TELEGRAM_MAX_WORKERS", 4, 1, 6)}'
+        )
+        return jsonify({'ok': True})
+
+    document = message.get('document')
+    if not document:
+        _telegram_send(chat_id, 'Please upload a ZIP, TXT, JSON, or COOKIES file.')
+        return jsonify({'ok': True})
+
+    database_user_id = os.environ.get('TELEGRAM_DATABASE_USER_ID', '').strip()
+    if not re.fullmatch(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', database_user_id):
+        _telegram_send(chat_id, 'Bot configuration error: TELEGRAM_DATABASE_USER_ID is missing or invalid.')
+        return jsonify({'ok': True})
+
+    update_id = update.get('update_id')
+    filename = os.path.basename(document.get('file_name') or 'upload.zip')
+    if update_id is not None and not _telegram_claim_update(
+        update_id, telegram_user_id, chat_id, filename
+    ):
+        return jsonify({'ok': True})
+
+    _telegram_send(chat_id, f'Processing {filename}. I will send the results when the batch is complete.')
+    try:
+        payload = _telegram_download_document(document)
+        results = _telegram_process_upload(payload, filename, database_user_id)
+        result_text, summary = _telegram_results_message(filename, results)
+        _telegram_send(chat_id, result_text)
+        if update_id is not None:
+            _telegram_finish_update(update_id, 'completed', summary=summary)
+    except Exception as exc:
+        logger.exception('Telegram cookie batch failed')
+        _telegram_send(chat_id, f'Batch failed: {str(exc)[:500]}')
+        if update_id is not None:
+            _telegram_finish_update(update_id, 'failed', error=exc)
+
+    return jsonify({'ok': True})
 
 @app.route('/api/accounts', methods=['GET', 'OPTIONS'])
 @cross_origin(supports_credentials=True)

@@ -37,3 +37,10 @@ alter table public.telegram_short_links enable row level security;
 
 -- No anon/authenticated policies are created. The backend service-role key is
 -- the only intended reader/writer for these operational tables.
+grant select, insert, update, delete
+    on table public.telegram_short_links
+    to service_role;
+
+-- Make the new table visible to Supabase REST immediately. This is safe to
+-- execute again when upgrading an existing installation.
+notify pgrst, 'reload schema';

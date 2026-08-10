@@ -104,6 +104,22 @@ def create_auth_client():
     return create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 
+def supabase_service_headers(prefer=None):
+    """Build Data API headers for legacy JWT and modern sb_secret_ keys."""
+    service_key = str(SUPABASE_SERVICE_KEY or '').strip()
+    headers = {
+        'apikey': service_key,
+        'Content-Type': 'application/json'
+    }
+    # Modern Supabase keys are opaque API keys, not JWTs. Sending one as a
+    # bearer token can cause a 401 before PostgREST evaluates the API key.
+    if service_key and not service_key.startswith('sb_'):
+        headers['Authorization'] = f'Bearer {service_key}'
+    if prefer:
+        headers['Prefer'] = prefer
+    return headers
+
+
 def get_user_profile(user):
     """Return the public profile fields used by the frontend."""
     try:
@@ -838,12 +854,9 @@ def store_netflix_account(email, netflix_id, secure_netflix_id, subscription_typ
             'is_expired': is_expired
         }
 
-        headers = {
-            'apikey': SUPABASE_SERVICE_KEY,
-            'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
-            'Content-Type': 'application/json',
-            'Prefer': 'return=representation,resolution=merge-duplicates'
-        }
+        headers = supabase_service_headers(
+            'return=representation,resolution=merge-duplicates'
+        )
 
         check_url = f"{SUPABASE_URL}/rest/v1/netflix_accounts?select=id&email=eq.{urllib.parse.quote(clean_email)}"
         check_resp = requests.get(check_url, headers=headers, timeout=30)
@@ -871,12 +884,7 @@ def store_netflix_account(email, netflix_id, secure_netflix_id, subscription_typ
 
 def log_token_generation(account_id, user_id, ip_address, token=None):
     try:
-        headers = {
-            'apikey': SUPABASE_SERVICE_KEY,
-            'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
-            'Content-Type': 'application/json',
-            'Prefer': 'return=representation'
-        }
+        headers = supabase_service_headers('return=representation')
         
         log_data = {
             'account_id': str(account_id),
@@ -1617,12 +1625,9 @@ def _telegram_cookie_files(payload, filename):
 
 def _telegram_claim_update(update_id, telegram_user_id, chat_id, filename):
     """Deduplicate Telegram retries. If migration is absent, continue with an error log."""
-    headers = {
-        'apikey': SUPABASE_SERVICE_KEY,
-        'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
-        'Content-Type': 'application/json',
-        'Prefer': 'resolution=ignore-duplicates,return=representation'
-    }
+    headers = supabase_service_headers(
+        'resolution=ignore-duplicates,return=representation'
+    )
     try:
         response = requests.post(
             f'{SUPABASE_URL}/rest/v1/telegram_bot_jobs',
@@ -1650,12 +1655,7 @@ def _telegram_finish_update(update_id, status, summary=None, error=None):
         requests.patch(
             f'{SUPABASE_URL}/rest/v1/telegram_bot_jobs',
             params={'update_id': f'eq.{update_id}'},
-            headers={
-                'apikey': SUPABASE_SERVICE_KEY,
-                'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
-                'Content-Type': 'application/json',
-                'Prefer': 'return=minimal'
-            },
+            headers=supabase_service_headers('return=minimal'),
             json={
                 'status': status,
                 'summary': summary,
@@ -1878,12 +1878,7 @@ def _telegram_create_short_login_urls(token_result, database_user_id, base_url):
     if expires_at <= datetime.now(timezone.utc):
         expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
 
-    headers = {
-        'apikey': SUPABASE_SERVICE_KEY,
-        'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
-        'Content-Type': 'application/json',
-        'Prefer': 'return=minimal'
-    }
+    headers = supabase_service_headers('return=minimal')
     try:
         # Opportunistic cleanup keeps the short-link table small without another cron.
         requests.delete(
@@ -1973,10 +1968,7 @@ def telegram_short_login_redirect(code, device):
     if not netflix_path:
         return Response('Invalid device link', status=404, mimetype='text/plain')
 
-    headers = {
-        'apikey': SUPABASE_SERVICE_KEY,
-        'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}'
-    }
+    headers = supabase_service_headers()
     try:
         response = requests.get(
             f'{SUPABASE_URL}/rest/v1/telegram_short_links',
@@ -2356,10 +2348,7 @@ def get_exclusive_accounts(user):
         })
         response = requests.get(
             f"{SUPABASE_URL}/rest/v1/netflix_accounts?{query}",
-            headers={
-                'apikey': SUPABASE_SERVICE_KEY,
-                'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}'
-            },
+            headers=supabase_service_headers(),
             timeout=30
         )
         if response.status_code != 200:
@@ -2606,12 +2595,7 @@ def cron_validate_accounts():
                     'message': 'cycle_started_at must be a valid ISO-8601 timestamp'
                 }), 400
 
-        headers = {
-            'apikey': SUPABASE_SERVICE_KEY,
-            'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
-            'Content-Type': 'application/json',
-            'Prefer': 'return=minimal'
-        }
+        headers = supabase_service_headers('return=minimal')
 
         # Recheck inactive records too; otherwise a temporarily failed account can never recover.
         # Scheduled calls only pick records due for a daily check. Manual full-cycle
@@ -2736,12 +2720,7 @@ def bulk_recheck_accounts(user):
         return '', 204
 
     try:
-        headers = {
-            'apikey': SUPABASE_SERVICE_KEY,
-            'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
-            'Content-Type': 'application/json',
-            'Prefer': 'return=minimal'
-        }
+        headers = supabase_service_headers('return=minimal')
         
         data = request.get_json() or {}
         chunk_size = data.get('chunk_size', 15)
@@ -2920,11 +2899,7 @@ def get_account_stats(user):
         return '', 204
 
     try:
-        headers = {
-            'apikey': SUPABASE_SERVICE_KEY,
-            'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
-            'Content-Type': 'application/json'
-        }
+        headers = supabase_service_headers()
 
         # Total accounts
         total_resp = requests.get(f"{SUPABASE_URL}/rest/v1/netflix_accounts?select=*&limit=1", 
@@ -3234,12 +3209,7 @@ def find_working_account_with_secure_id(user_id):
 def log_tv_auth_attempt(user_id, code, status, ip_address):
     """Log TV authentication attempts"""
     try:
-        headers = {
-            'apikey': SUPABASE_SERVICE_KEY,
-            'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
-            'Content-Type': 'application/json',
-            'Prefer': 'return=representation'
-        }
+        headers = supabase_service_headers('return=representation')
 
         log_data = {
             'user_id': str(user_id),
@@ -3347,12 +3317,7 @@ def _tv_env_int(name, default, minimum, maximum):
 
 
 def _tv_service_headers(prefer='return=minimal'):
-    return {
-        'apikey': SUPABASE_SERVICE_KEY,
-        'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
-        'Content-Type': 'application/json',
-        'Prefer': prefer
-    }
+    return supabase_service_headers(prefer)
 
 
 def _tv_account_summary(account):

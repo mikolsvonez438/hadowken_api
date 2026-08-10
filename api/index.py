@@ -15,6 +15,7 @@ import tempfile
 import shutil
 import uuid
 import hashlib
+import html
 import time
 from datetime import datetime, timedelta, timezone
 from supabase import create_client, Client
@@ -1511,11 +1512,17 @@ def _telegram_api(method, payload=None, timeout=20):
     return data.get('result')
 
 
-def _telegram_send(chat_id, text, reply_markup=None):
+def _telegram_send(chat_id, text, reply_markup=None, parse_mode=None):
     """Send plain text in chunks without ever including cookie values."""
     text = str(text or '')
     chunks = []
+    if parse_mode:
+        # Telegram applies the message limit after parsing entities. Keeping the
+        # HTML intact prevents splitting inside a hidden href attribute.
+        chunks = [text]
     while text:
+        if chunks:
+            break
         if len(text) <= 3500:
             chunks.append(text)
             break
@@ -1529,6 +1536,9 @@ def _telegram_send(chat_id, text, reply_markup=None):
         outgoing_chunks = chunks or ['']
         for index, chunk in enumerate(outgoing_chunks):
             payload = {'chat_id': chat_id, 'text': chunk}
+            if parse_mode:
+                payload['parse_mode'] = parse_mode
+                payload['link_preview_options'] = {'is_disabled': True}
             if reply_markup and index == len(outgoing_chunks) - 1:
                 payload['reply_markup'] = reply_markup
             last_message = _telegram_api('sendMessage', payload)
@@ -1538,15 +1548,19 @@ def _telegram_send(chat_id, text, reply_markup=None):
         return None
 
 
-def _telegram_edit(chat_id, message_id, text, reply_markup=None):
+def _telegram_edit(chat_id, message_id, text, reply_markup=None, parse_mode=None):
     if not message_id:
         return None
     try:
+        message_text = str(text or '')
         payload = {
             'chat_id': chat_id,
             'message_id': message_id,
-            'text': str(text or '')[:3500]
+            'text': message_text if parse_mode else message_text[:3500]
         }
+        if parse_mode:
+            payload['parse_mode'] = parse_mode
+            payload['link_preview_options'] = {'is_disabled': True}
         if reply_markup:
             payload['reply_markup'] = reply_markup
         return _telegram_api('editMessageText', payload)
@@ -2032,26 +2046,28 @@ def _telegram_random_account(database_user_id, chat_id, message_id, ip_address, 
             ip_address=ip_address,
             token=token_result.get('token')
         )
-        short_urls, short_link_error = _telegram_create_short_login_urls(
-            token_result, database_user_id, base_url
-        )
-        keyboard = _telegram_login_copy_keyboard(short_urls)
-        copy_hint = (
-            '👇 Tap a button below to copy the login link.'
-            if keyboard else
-            f'⚠️ Copy buttons could not be created. {short_link_error}'
-        )
+        token = str(token_result.get('token') or '')
+        if not token:
+            continue
+        encoded_token = urllib.parse.quote(token, safe='')
+        phone_url = f'https://netflix.com/unsupported?nftoken={encoded_token}'
+        tv_url = f'https://netflix.com/tv8?nftoken={encoded_token}'
+        pc_url = f'https://netflix.com/browse?nftoken={encoded_token}'
         return True, (
-            '🎟️ RANDOM ACCOUNT READY\n'
+            '<b>🎟️ RANDOM ACCOUNT READY</b>\n'
             '━━━━━━━━━━━━━━━━━━━━\n'
-            f'👤 Account: {summary["email"]}\n'
-            f'🌍 Country: {summary["country"]}\n'
-            f'👑 Plan: {summary["plan"]}\n'
-            f'🎯 Priority: {tier_label}\n'
+            f'👤 Account: <code>{html.escape(str(summary["email"]))}</code>\n'
+            f'🌍 Country: {html.escape(str(summary["country"]))}\n'
+            f'👑 Plan: {html.escape(str(summary["plan"]))}\n'
+            f'🎯 Priority: {html.escape(str(tier_label))}\n'
             f'🔎 Accounts checked: {attempt}\n'
             '━━━━━━━━━━━━━━━━━━━━\n'
-            f'{copy_hint}'
-        ), keyboard
+            '<b>Login links</b>\n'
+            f'<a href="{html.escape(phone_url, quote=True)}">📱 Open Phone Login</a>\n'
+            f'<a href="{html.escape(tv_url, quote=True)}">📺 Open TV Login</a>\n'
+            f'<a href="{html.escape(pc_url, quote=True)}">💻 Open PC Login</a>\n\n'
+            '<i>Tap a link to open it.</i>'
+        ), None
     return False, f'No working account was found after {len(candidates)} prioritized attempt(s).', None
 
 
@@ -2153,8 +2169,20 @@ def telegram_webhook():
             request.url_root.rstrip('/')
         )
         final_text = result_message if success else '❌ RANDOM ACCOUNT FAILED\n\n' + result_message
-        if not _telegram_edit(chat_id, progress_id, final_text, reply_markup=reply_markup):
-            _telegram_send(chat_id, final_text, reply_markup=reply_markup)
+        parse_mode = 'HTML' if success else None
+        if not _telegram_edit(
+            chat_id,
+            progress_id,
+            final_text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode
+        ):
+            _telegram_send(
+                chat_id,
+                final_text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode
+            )
         if update_id is not None:
             _telegram_finish_update(
                 update_id, 'completed', summary={'operation': 'random', 'success': success}

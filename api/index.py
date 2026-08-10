@@ -1869,7 +1869,7 @@ def _telegram_create_short_login_urls(token_result, database_user_id, base_url):
     """Store the long Netflix token server-side and return copy-button-safe URLs."""
     token = str((token_result or {}).get('token') or '')
     if not token:
-        return None
+        return None, 'Netflix did not return a login token.'
     try:
         expires_epoch = int((token_result or {}).get('expires') or 0)
         expires_at = datetime.fromtimestamp(expires_epoch, timezone.utc)
@@ -1905,19 +1905,46 @@ def _telegram_create_short_login_urls(token_result, database_user_id, base_url):
                 },
                 timeout=15
             )
-            if response.status_code == 201:
+            if response.status_code in (200, 201):
                 origin = str(base_url or '').rstrip('/')
                 return {
                     'phone': f'{origin}/t/{code}/phone',
                     'tv': f'{origin}/t/{code}/tv',
                     'pc': f'{origin}/t/{code}/pc'
-                }
+                }, None
             if response.status_code != 409:
-                logger.error(f'Telegram short-link insert failed: HTTP {response.status_code}')
-                break
+                try:
+                    error_payload = response.json()
+                except ValueError:
+                    error_payload = {}
+                error_code = str(error_payload.get('code') or '').strip()
+                error_message = str(error_payload.get('message') or response.text or '').strip()
+                logger.error(
+                    'Telegram short-link insert failed: HTTP %s, code=%s, response=%s',
+                    response.status_code,
+                    error_code or 'unknown',
+                    error_message[:500]
+                )
+                if response.status_code == 404 or error_code in ('PGRST204', 'PGRST205'):
+                    return None, (
+                        'Supabase REST has not loaded telegram_short_links yet. '
+                        'Run the latest migration, including the schema-cache reload.'
+                    )
+                if response.status_code in (401, 403):
+                    return None, (
+                        'Supabase denied the backend service role. Verify '
+                        'SUPABASE_SERVICE_KEY in Vercel and run the latest migration grants.'
+                    )
+                detail = f'HTTP {response.status_code}'
+                if error_code:
+                    detail += f' / {error_code}'
+                if error_message:
+                    detail += f': {error_message[:160]}'
+                return None, f'Supabase could not save the short login link ({detail}).'
     except Exception as exc:
         logger.error(f'Telegram short-link creation failed: {exc}')
-    return None
+        return None, f'Short-link request failed: {str(exc)[:160]}'
+    return None, 'Supabase could not allocate a unique short-link code.'
 
 
 def _telegram_login_copy_keyboard(urls):
@@ -2013,14 +2040,14 @@ def _telegram_random_account(database_user_id, chat_id, message_id, ip_address, 
             ip_address=ip_address,
             token=token_result.get('token')
         )
-        short_urls = _telegram_create_short_login_urls(
+        short_urls, short_link_error = _telegram_create_short_login_urls(
             token_result, database_user_id, base_url
         )
         keyboard = _telegram_login_copy_keyboard(short_urls)
         copy_hint = (
             '👇 Tap a button below to copy the login link.'
             if keyboard else
-            '⚠️ Copy buttons could not be created. Run the latest Telegram SQL migration.'
+            f'⚠️ Copy buttons could not be created. {short_link_error}'
         )
         return True, (
             '🎟️ RANDOM ACCOUNT READY\n'

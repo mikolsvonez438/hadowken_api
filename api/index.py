@@ -1573,9 +1573,11 @@ def _telegram_cookie_files(payload, filename):
     if extension != '.zip':
         raise ValueError('Upload a .zip, .txt, .json, or .cookies file')
 
-    max_files = _telegram_env_int('TELEGRAM_MAX_COOKIE_FILES', 25, 1, 50)
+    # Large seller/export ZIPs commonly contain hundreds of cookie files.
+    # The high ceiling is only an emergency ZIP-bomb guard, not a normal batch limit.
+    max_files = _telegram_env_int('TELEGRAM_MAX_COOKIE_FILES', 3000, 1, 5000)
     max_uncompressed = _telegram_env_int(
-        'TELEGRAM_MAX_UNCOMPRESSED_MB', 25, 1, 50
+        'TELEGRAM_MAX_UNCOMPRESSED_MB', 50, 1, 100
     ) * 1024 * 1024
     supported = ('.txt', '.json', '.cookies')
     extracted = []
@@ -1692,7 +1694,7 @@ def _telegram_process_upload(payload, filename, database_user_id, progress_callb
         progress_callback(len(results), total, results)
 
     workers = min(
-        _telegram_env_int('TELEGRAM_MAX_WORKERS', 4, 1, 6),
+        _telegram_env_int('TELEGRAM_MAX_WORKERS', 12, 1, 20),
         len(unique_files)
     )
     if workers:
@@ -1817,8 +1819,8 @@ def telegram_webhook():
         _telegram_send(
             chat_id,
             'Bot status: ready\n'
-            f'Max cookie files per ZIP: {_telegram_env_int("TELEGRAM_MAX_COOKIE_FILES", 25, 1, 50)}\n'
-            f'Workers: {_telegram_env_int("TELEGRAM_MAX_WORKERS", 4, 1, 6)}'
+            f'Max cookie files per ZIP: {_telegram_env_int("TELEGRAM_MAX_COOKIE_FILES", 3000, 1, 5000)}\n'
+            f'Workers: {_telegram_env_int("TELEGRAM_MAX_WORKERS", 12, 1, 20)}'
         )
         return jsonify({'ok': True})
 

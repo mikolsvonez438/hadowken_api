@@ -71,6 +71,18 @@ def main():
             },
         )
         print(f"Webhook registration result: {result}")
+        telegram_call(
+            args.token,
+            "setMyCommands",
+            {
+                "commands": [
+                    {"command": "start", "description": "Show bot instructions"},
+                    {"command": "status", "description": "Check bot status and limits"},
+                    {"command": "help", "description": "Show upload instructions"},
+                ]
+            },
+        )
+        print("Bot commands registered: /start, /status, /help")
 
     info = telegram_call(args.token, "getWebhookInfo")
     # Telegram does not return the bot token or webhook secret here.

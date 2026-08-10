@@ -1517,12 +1517,27 @@ def _telegram_send(chat_id, text):
         chunks.append(text[:split_at])
         text = text[split_at:].lstrip('\n')
     try:
+        last_message = None
         for chunk in chunks or ['']:
-            _telegram_api('sendMessage', {'chat_id': chat_id, 'text': chunk})
-        return True
+            last_message = _telegram_api('sendMessage', {'chat_id': chat_id, 'text': chunk})
+        return last_message
     except Exception as exc:
         logger.error(f'Telegram sendMessage failed: {exc}')
-        return False
+        return None
+
+
+def _telegram_edit(chat_id, message_id, text):
+    if not message_id:
+        return None
+    try:
+        return _telegram_api('editMessageText', {
+            'chat_id': chat_id,
+            'message_id': message_id,
+            'text': str(text or '')[:3500]
+        })
+    except Exception as exc:
+        logger.warning(f'Telegram progress update failed: {exc}')
+        return None
 
 
 def _telegram_download_document(document):
@@ -1644,7 +1659,7 @@ def _telegram_finish_update(update_id, status, summary=None, error=None):
         logger.error(f'Unable to finish Telegram job {update_id}: {exc}')
 
 
-def _telegram_process_upload(payload, filename, database_user_id):
+def _telegram_process_upload(payload, filename, database_user_id, progress_callback=None):
     files = _telegram_cookie_files(payload, filename)
     results = []
     unique_files = []
@@ -1672,6 +1687,10 @@ def _telegram_process_upload(payload, filename, database_user_id):
         fingerprints.add(fingerprint)
         unique_files.append((entry_name, content))
 
+    total = len(results) + len(unique_files)
+    if progress_callback:
+        progress_callback(len(results), total, results)
+
     workers = min(
         _telegram_env_int('TELEGRAM_MAX_WORKERS', 4, 1, 6),
         len(unique_files)
@@ -1694,7 +1713,28 @@ def _telegram_process_upload(payload, filename, database_user_id):
                         'filename': entry_name,
                         'message': str(exc)
                     })
+                if progress_callback:
+                    progress_callback(len(results), total, results)
     return results
+
+
+def _telegram_progress_message(filename, completed, total, results):
+    valid = len([item for item in results if item.get('status') == 'success'])
+    saved = len([
+        item for item in results
+        if item.get('status') == 'success' and item.get('stored_in_db')
+    ])
+    invalid = len([item for item in results if item.get('status') == 'error'])
+    duplicates = len([item for item in results if item.get('status') == 'duplicate'])
+    percent = int((completed / total) * 100) if total else 100
+    filled = min(10, max(0, int(percent / 10)))
+    bar = '[' + ('#' * filled) + ('-' * (10 - filled)) + ']'
+    return (
+        f'Checking {os.path.basename(filename)}\n'
+        f'{bar} {completed}/{total} ({percent}%)\n'
+        f'Valid: {valid} | Saved: {saved}\n'
+        f'Invalid: {invalid} | Duplicates: {duplicates}'
+    )
 
 
 def _telegram_results_message(filename, results):
@@ -1799,17 +1839,47 @@ def telegram_webhook():
     ):
         return jsonify({'ok': True})
 
-    _telegram_send(chat_id, f'Processing {filename}. I will send the results when the batch is complete.')
+    progress_message = _telegram_send(
+        chat_id,
+        f'Upload received: {filename}\nDownloading and reading the cookie files...'
+    )
+    progress_message_id = (
+        progress_message.get('message_id') if isinstance(progress_message, dict) else None
+    )
+    last_progress_edit = {'time': 0.0}
+
+    def report_progress(completed, total, current_results):
+        now = time.monotonic()
+        if completed < total and now - last_progress_edit['time'] < 1.5:
+            return
+        _telegram_edit(
+            chat_id,
+            progress_message_id,
+            _telegram_progress_message(filename, completed, total, current_results)
+        )
+        last_progress_edit['time'] = now
+
     try:
         payload = _telegram_download_document(document)
-        results = _telegram_process_upload(payload, filename, database_user_id)
+        results = _telegram_process_upload(
+            payload, filename, database_user_id, progress_callback=report_progress
+        )
         result_text, summary = _telegram_results_message(filename, results)
+        _telegram_edit(
+            chat_id,
+            progress_message_id,
+            f'Checking complete: {filename}\n'
+            f'{summary["total"]} checked | {summary["valid"]} valid | '
+            f'{summary["saved"]} saved | {summary["invalid"]} invalid'
+        )
         _telegram_send(chat_id, result_text)
         if update_id is not None:
             _telegram_finish_update(update_id, 'completed', summary=summary)
     except Exception as exc:
         logger.exception('Telegram cookie batch failed')
-        _telegram_send(chat_id, f'Batch failed: {str(exc)[:500]}')
+        failure_message = f'Batch failed: {str(exc)[:500]}'
+        if not _telegram_edit(chat_id, progress_message_id, failure_message):
+            _telegram_send(chat_id, failure_message)
         if update_id is not None:
             _telegram_finish_update(update_id, 'failed', error=exc)
 

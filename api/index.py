@@ -1874,14 +1874,62 @@ def _account_was_recently_validated(account, freshness_minutes=None):
     return timedelta(0) <= age <= timedelta(minutes=freshness_minutes)
 
 
-def _telegram_priority_pool(per_tier=None, prefer_recent=False):
+def _telegram_recent_random_account_ids(chat_id, limit=None):
+    """Return recently served /random account IDs, newest first, for one chat."""
+    if limit is None:
+        limit = _telegram_env_int(
+            'TELEGRAM_RANDOM_HISTORY_SIZE', 20, 1, 100
+        )
+    try:
+        response = requests.get(
+            f'{SUPABASE_URL}/rest/v1/telegram_bot_jobs',
+            params={
+                'select': 'summary',
+                'chat_id': f'eq.{chat_id}',
+                'filename': 'eq./random',
+                'status': 'eq.completed',
+                'order': 'completed_at.desc.nullslast,created_at.desc',
+                'limit': str(limit)
+            },
+            headers=supabase_service_headers(),
+            timeout=10
+        )
+        if response.status_code != 200:
+            logger.warning(
+                'Unable to load Telegram random history (%s): %s',
+                response.status_code,
+                response.text[:300]
+            )
+            return []
+
+        recent_ids = []
+        seen = set()
+        for row in response.json():
+            summary = row.get('summary') if isinstance(row, dict) else None
+            account_id = summary.get('account_id') if isinstance(summary, dict) else None
+            normalized_id = str(account_id or '').strip()
+            if normalized_id and normalized_id not in seen:
+                recent_ids.append(normalized_id)
+                seen.add(normalized_id)
+        return recent_ids
+    except Exception as exc:
+        logger.warning('Unable to load Telegram random history: %s', exc)
+        return []
+
+
+def _telegram_priority_pool(
+    per_tier=None, prefer_recent=False, recent_account_ids=None
+):
     if per_tier is None:
         per_tier = _telegram_env_int(
             'TELEGRAM_ACCOUNT_ATTEMPTS_PER_TIER', 6, 1, 15
         )
     candidates = _get_random_tv_candidates(None)
     return _prioritized_tv_candidates(
-        candidates, per_tier, prefer_recent=prefer_recent
+        candidates,
+        per_tier,
+        prefer_recent=prefer_recent,
+        recent_account_ids=recent_account_ids
     )
 
 
@@ -2094,14 +2142,17 @@ def _telegram_random_account(database_user_id, chat_id, message_id, ip_address, 
         attempts_per_tier = _telegram_env_int(
             'TELEGRAM_RANDOM_ATTEMPTS_PER_TIER', 25, 1, 100
         )
+        recent_account_ids = _telegram_recent_random_account_ids(chat_id)
         candidates = _telegram_priority_pool(
-            per_tier=attempts_per_tier, prefer_recent=True
+            per_tier=attempts_per_tier,
+            prefer_recent=True,
+            recent_account_ids=recent_account_ids
         )
     except Exception as exc:
         logger.exception('Telegram random-account loading failed')
-        return False, f'Unable to load the account pool: {exc}', None
+        return False, f'Unable to load the account pool: {exc}', None, None
     if not candidates:
-        return False, 'No active accounts with both NetflixId cookies are available.', None
+        return False, 'No active accounts with both NetflixId cookies are available.', None, None
 
     timeout_seconds = _telegram_env_int(
         'TELEGRAM_RANDOM_TIMEOUT_SECONDS', 90, 30, 240
@@ -2173,13 +2224,13 @@ def _telegram_random_account(database_user_id, chat_id, message_id, ip_address, 
             f'<a href="{html.escape(tv_url, quote=True)}">📺 Open TV Login</a>\n'
             f'<a href="{html.escape(pc_url, quote=True)}">💻 Open PC Login</a>\n\n'
             '<i>Tap a link to open it.</i>'
-        ), None
+        ), None, str(account.get('id') or '') or None
     if timed_out:
         return False, (
             f'No working account was found before the {timeout_seconds}-second safety limit '
             f'after {attempts} prioritized attempt(s).'
-        ), None
-    return False, f'No working account was found after {attempts} prioritized attempt(s).', None
+        ), None, None
+    return False, f'No working account was found after {attempts} prioritized attempt(s).', None, None
 
 
 @app.route('/api/telegram/webhook', methods=['POST'])
@@ -2280,7 +2331,7 @@ def telegram_webhook():
             'Finding a random working account.\nPriority: PH Premium -> US Premium -> other active subscriptions.'
         )
         progress_id = progress.get('message_id') if isinstance(progress, dict) else None
-        success, result_message, reply_markup = _telegram_random_account(
+        success, result_message, reply_markup, selected_account_id = _telegram_random_account(
             database_user_id,
             chat_id,
             progress_id,
@@ -2303,8 +2354,11 @@ def telegram_webhook():
                 parse_mode=parse_mode
             )
         if update_id is not None:
+            random_summary = {'operation': 'random', 'success': success}
+            if selected_account_id:
+                random_summary['account_id'] = selected_account_id
             _telegram_finish_update(
-                update_id, 'completed', summary={'operation': 'random', 'success': success}
+                update_id, 'completed', summary=random_summary
             )
         return jsonify({'ok': True})
     if text.startswith('/status'):
@@ -3692,7 +3746,9 @@ def _tv_candidate_priority(account):
     return 2, 'Other active subscription'
 
 
-def _prioritized_tv_candidates(candidates, per_tier, prefer_recent=False):
+def _prioritized_tv_candidates(
+    candidates, per_tier, prefer_recent=False, recent_account_ids=None
+):
     """Randomize within each priority tier and guarantee fallback tiers get attempts."""
     tiers = {0: [], 1: [], 2: []}
     for account in candidates:
@@ -3700,14 +3756,29 @@ def _prioritized_tv_candidates(candidates, per_tier, prefer_recent=False):
         tiers[priority].append(account)
 
     secure_random = random.SystemRandom()
+    recent_rank = {
+        str(account_id): rank
+        for rank, account_id in enumerate(recent_account_ids or [])
+        if account_id
+    }
     selected = []
     for priority in (0, 1, 2):
         secure_random.shuffle(tiers[priority])
-        if prefer_recent:
-            # Stable sorting preserves random order inside fresh/stale groups.
-            tiers[priority].sort(
-                key=lambda account: not _account_was_recently_validated(account)
-            )
+        # Keep the tier priority intact, but rotate accounts within each tier.
+        # Never-served accounts come first. Previously served accounts are ordered
+        # from least-recent to most-recent, preventing immediate repeats whenever
+        # another candidate exists.
+        def candidate_order(account):
+            account_id = str(account.get('id') or '')
+            served_rank = recent_rank.get(account_id)
+            was_served = served_rank is not None
+            validation_rank = (
+                0 if _account_was_recently_validated(account) else 1
+            ) if prefer_recent else 0
+            rotation_rank = -served_rank if was_served else 0
+            return was_served, rotation_rank, validation_rank
+
+        tiers[priority].sort(key=candidate_order)
         selected.extend(tiers[priority][:per_tier])
     return selected
 

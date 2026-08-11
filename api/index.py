@@ -1874,8 +1874,8 @@ def _account_was_recently_validated(account, freshness_minutes=None):
     return timedelta(0) <= age <= timedelta(minutes=freshness_minutes)
 
 
-def _telegram_recent_random_account_ids(chat_id, limit=None):
-    """Return recently served /random account IDs, newest first, for one chat."""
+def _telegram_recent_account_ids(chat_id, command_name, limit=None):
+    """Return account IDs recently served by one account command, newest first."""
     if limit is None:
         limit = _telegram_env_int(
             'TELEGRAM_RANDOM_HISTORY_SIZE', 20, 1, 100
@@ -1886,7 +1886,7 @@ def _telegram_recent_random_account_ids(chat_id, limit=None):
             params={
                 'select': 'summary',
                 'chat_id': f'eq.{chat_id}',
-                'filename': 'eq./random',
+                'filename': f'eq.{command_name}',
                 'status': 'eq.completed',
                 'order': 'completed_at.desc.nullslast,created_at.desc',
                 'limit': str(limit)
@@ -1896,7 +1896,7 @@ def _telegram_recent_random_account_ids(chat_id, limit=None):
         )
         if response.status_code != 200:
             logger.warning(
-                'Unable to load Telegram random history (%s): %s',
+                'Unable to load Telegram account history (%s): %s',
                 response.status_code,
                 response.text[:300]
             )
@@ -1913,34 +1913,89 @@ def _telegram_recent_random_account_ids(chat_id, limit=None):
                 seen.add(normalized_id)
         return recent_ids
     except Exception as exc:
-        logger.warning('Unable to load Telegram random history: %s', exc)
+        logger.warning('Unable to load Telegram account history: %s', exc)
         return []
 
 
-def _telegram_priority_pool(
-    per_tier=None, prefer_recent=False, recent_account_ids=None
+def _normalized_account_country(account):
+    country = str(account.get('country') or '').strip().upper()
+    aliases = {
+        'PHILIPPINES': 'PH',
+        'PILIPINAS': 'PH',
+        'UNITED STATES': 'US',
+        'UNITED STATES OF AMERICA': 'US',
+        'USA': 'US'
+    }
+    return aliases.get(country, country)
+
+
+def _telegram_pool_label(pool_type):
+    return {
+        'ph': 'PH accounts only',
+        'us': 'US accounts only',
+        'admin': 'PH and US accounts only',
+        'public': 'All countries except PH and US'
+    }.get(pool_type, 'All countries except PH and US')
+
+
+def _telegram_pool_candidates(
+    candidates, pool_type, max_accounts, recent_account_ids=None
 ):
-    if per_tier is None:
-        per_tier = _telegram_env_int(
-            'TELEGRAM_ACCOUNT_ATTEMPTS_PER_TIER', 6, 1, 15
-        )
+    """Filter by country pool, shuffle, then avoid recently served accounts."""
+    def is_eligible(account):
+        country = _normalized_account_country(account)
+        if pool_type == 'ph':
+            return country == 'PH'
+        if pool_type == 'us':
+            return country == 'US'
+        if pool_type == 'admin':
+            return country in ('PH', 'US')
+        return country not in ('PH', 'US')
+
+    eligible = [account for account in candidates if is_eligible(account)]
+    random.SystemRandom().shuffle(eligible)
+    recent_rank = {
+        str(account_id): rank
+        for rank, account_id in enumerate(recent_account_ids or [])
+        if account_id
+    }
+
+    def rotation_order(account):
+        served_rank = recent_rank.get(str(account.get('id') or ''))
+        # Unseen accounts first. Among seen accounts, the least-recently used
+        # one comes first and the most-recently used one comes last.
+        return served_rank is not None, -served_rank if served_rank is not None else 0
+
+    eligible.sort(key=rotation_order)
+    return eligible[:max_accounts]
+
+
+def _telegram_account_pool(max_accounts, pool_type='public', recent_account_ids=None):
     candidates = _get_random_tv_candidates(None)
-    return _prioritized_tv_candidates(
+    return _telegram_pool_candidates(
         candidates,
-        per_tier,
-        prefer_recent=prefer_recent,
+        pool_type,
+        max_accounts,
         recent_account_ids=recent_account_ids
     )
 
 
-def _telegram_tv_login(code, database_user_id, chat_id, message_id, ip_address):
+def _telegram_tv_login(
+    code, database_user_id, chat_id, message_id, ip_address, pool_type='public'
+):
     try:
-        candidates = _telegram_priority_pool()
+        max_accounts = _telegram_env_int(
+            'TELEGRAM_ACCOUNT_ATTEMPTS_PER_TIER', 6, 1, 15
+        )
+        candidates = _telegram_account_pool(max_accounts, pool_type=pool_type)
     except Exception as exc:
         logger.exception('Telegram TV candidate loading failed')
         return False, f'Unable to load the account pool: {exc}'
     if not candidates:
-        return False, 'No active accounts with both NetflixId cookies are available.'
+        return False, (
+            f'No active accounts with both NetflixId cookies are available in '
+            f'{_telegram_pool_label(pool_type)}.'
+        )
 
     timeout_seconds = _telegram_env_int('TELEGRAM_TV_TIMEOUT_SECONDS', 90, 30, 240)
     started_at = time.monotonic()
@@ -1950,12 +2005,12 @@ def _telegram_tv_login(code, database_user_id, chat_id, message_id, ip_address):
         if attempts and time.monotonic() - started_at >= timeout_seconds:
             break
         attempts += 1
-        _, tier_label = _tv_candidate_priority(account)
+        pool_label = _telegram_pool_label(pool_type)
         _telegram_edit(
             chat_id,
             message_id,
             f'TV login: checking account {attempts}/{len(candidates)}\n'
-            f'Priority group: {tier_label}\n'
+            f'Pool: {pool_label}\n'
             'Validating membership and TV-login compatibility...'
         )
 
@@ -1985,7 +2040,7 @@ def _telegram_tv_login(code, database_user_id, chat_id, message_id, ip_address):
                 f'Account: {summary["email"]}\n'
                 f'Country: {summary["country"]}\n'
                 f'Plan: {summary["plan"]}\n'
-                f'Priority group: {tier_label}\n'
+                f'Pool: {pool_label}\n'
                 f'Accounts checked: {attempts}\n\n'
                 f'{result_message}'
             )
@@ -2003,7 +2058,7 @@ def _telegram_tv_login(code, database_user_id, chat_id, message_id, ip_address):
     reason = skipped[-1] if skipped else 'No compatible account passed validation'
     if timed_out:
         return False, f'TV login stopped after the {timeout_seconds}-second safety window. Last result: {reason}'
-    return False, f'No usable account was found after {attempts} prioritized attempt(s). Last result: {reason}'
+    return False, f'No usable account was found after {attempts} random attempt(s). Last result: {reason}'
 
 
 def _telegram_create_short_login_urls(token_result, database_user_id, base_url):
@@ -2137,22 +2192,36 @@ def telegram_short_login_redirect(code, device):
         return Response('Unable to resolve this login link', status=500, mimetype='text/plain')
 
 
-def _telegram_random_account(database_user_id, chat_id, message_id, ip_address, base_url):
+def _telegram_random_account(
+    database_user_id,
+    chat_id,
+    message_id,
+    ip_address,
+    base_url,
+    pool_type='public',
+    command_name='/random',
+    result_title='RANDOM ACCOUNT'
+):
     try:
-        attempts_per_tier = _telegram_env_int(
+        max_attempts = _telegram_env_int(
             'TELEGRAM_RANDOM_ATTEMPTS_PER_TIER', 25, 1, 100
         )
-        recent_account_ids = _telegram_recent_random_account_ids(chat_id)
-        candidates = _telegram_priority_pool(
-            per_tier=attempts_per_tier,
-            prefer_recent=True,
+        recent_account_ids = _telegram_recent_account_ids(
+            chat_id, command_name
+        )
+        candidates = _telegram_account_pool(
+            max_attempts,
+            pool_type=pool_type,
             recent_account_ids=recent_account_ids
         )
     except Exception as exc:
         logger.exception('Telegram random-account loading failed')
         return False, f'Unable to load the account pool: {exc}', None, None
     if not candidates:
-        return False, 'No active accounts with both NetflixId cookies are available.', None, None
+        return False, (
+            f'No active accounts with both NetflixId cookies are available in '
+            f'{_telegram_pool_label(pool_type)}.'
+        ), None, None
 
     timeout_seconds = _telegram_env_int(
         'TELEGRAM_RANDOM_TIMEOUT_SECONDS', 90, 30, 240
@@ -2166,7 +2235,7 @@ def _telegram_random_account(database_user_id, chat_id, message_id, ip_address, 
             timed_out = True
             break
         attempts = attempt
-        _, tier_label = _tv_candidate_priority(account)
+        pool_label = _telegram_pool_label(pool_type)
         recently_validated = _account_was_recently_validated(account)
         if attempt == 1 or attempt % 5 == 0:
             validation_note = (
@@ -2178,7 +2247,7 @@ def _telegram_random_account(database_user_id, chat_id, message_id, ip_address, 
                 chat_id,
                 message_id,
                 f'Random account: checking {attempt}/{len(candidates)}\n'
-                f'Priority group: {tier_label}\n'
+                f'Pool: {pool_label}\n'
                 f'{validation_note}'
             )
         if not recently_validated:
@@ -2210,13 +2279,13 @@ def _telegram_random_account(database_user_id, chat_id, message_id, ip_address, 
         tv_url = f'https://netflix.com/tv8?nftoken={encoded_token}'
         pc_url = f'https://netflix.com/browse?nftoken={encoded_token}'
         return True, (
-            '<b>🎟️ RANDOM ACCOUNT READY</b>\n'
+            f'<b>🎟️ {html.escape(result_title)} READY</b>\n'
             '━━━━━━━━━━━━━━━━━━━━\n'
             f'👤 Account: <code>{html.escape(str(summary["email"]))}</code>\n'
             f'🌍 Country: {html.escape(str(summary["country"]))}\n'
             f'👑 Plan: {html.escape(str(summary["plan"]))}\n'
             f'📅 Renewal: {html.escape(str(summary["renewal"] or "Not available"))}\n'
-            f'🎯 Priority: {html.escape(str(tier_label))}\n'
+            f'🎯 Pool: {html.escape(str(pool_label))}\n'
             f'🔎 Accounts checked: {attempt}\n'
             '━━━━━━━━━━━━━━━━━━━━\n'
             '<b>Login links</b>\n'
@@ -2228,9 +2297,9 @@ def _telegram_random_account(database_user_id, chat_id, message_id, ip_address, 
     if timed_out:
         return False, (
             f'No working account was found before the {timeout_seconds}-second safety limit '
-            f'after {attempts} prioritized attempt(s).'
+            f'after {attempts} random attempt(s).'
         ), None, None
-    return False, f'No working account was found after {attempts} prioritized attempt(s).', None, None
+    return False, f'No working account was found after {attempts} random attempt(s).', None, None
 
 
 @app.route('/api/telegram/webhook', methods=['POST'])
@@ -2265,20 +2334,28 @@ def telegram_webhook():
             'Netflix account bot is ready.\n\n'
             'Upload a ZIP containing .txt/.json cookie files, or upload one cookie file directly. '
             'I will validate each unique account and save/update working memberships in Supabase.\n\n'
-            'TV login: /tv 12345678\n'
-            'Random prioritized account: /random\n\n'
-            'Priority: PH Premium, then US Premium, then other active subscriptions.\n\n'
-            'Commands: /tv, /random, /status, /help'
+            'Account links:\n'
+            '/ph - PH accounts only\n'
+            '/us - US accounts only\n'
+            '/random - all countries except PH and US\n\n'
+            'TV login:\n'
+            '/tv 12345678 - all countries except PH and US\n'
+            '/tvadmin 12345678 - PH and US accounts only\n\n'
+            'Commands: /ph, /us, /random, /tv, /tvadmin, /status, /help'
         )
         return jsonify({'ok': True})
-    tv_match = re.fullmatch(r'/tv(?:@\w+)?(?:\s+(\d{8}))?\s*', raw_text, re.I)
+    tv_match = re.fullmatch(
+        r'/(tvadmin|tv)(?:@\w+)?(?:\s+(\d{8}))?\s*', raw_text, re.I
+    )
     plain_code_match = re.fullmatch(r'\d{8}', raw_text)
     if tv_match or plain_code_match:
-        code = plain_code_match.group(0) if plain_code_match else tv_match.group(1)
+        tv_command = 'tv' if plain_code_match else tv_match.group(1).lower()
+        code = plain_code_match.group(0) if plain_code_match else tv_match.group(2)
+        tv_pool_type = 'admin' if tv_command == 'tvadmin' else 'public'
         if not code:
             _telegram_send(
                 chat_id,
-                'Send the 8-digit code like this:\n/tv 12345678\n\n'
+                f'Send the 8-digit code like this:\n/{tv_command} 12345678\n\n'
                 'You can also send only the 8 digits in your next message.'
             )
             return jsonify({'ok': True})
@@ -2288,7 +2365,7 @@ def telegram_webhook():
             return jsonify({'ok': True})
         if update_id is not None:
             claim_result = _telegram_claim_update(
-                update_id, telegram_user_id, chat_id, '/tv'
+                update_id, telegram_user_id, chat_id, f'/{tv_command}'
             )
             if claim_result is not True:
                 if claim_result is None:
@@ -2296,31 +2373,53 @@ def telegram_webhook():
                 return jsonify({'ok': True})
         progress = _telegram_send(
             chat_id,
-            'TV login started.\nPriority: PH Premium -> US Premium -> other active subscriptions.'
+            f'TV login started.\nPool: {_telegram_pool_label(tv_pool_type)}.'
         )
         progress_id = progress.get('message_id') if isinstance(progress, dict) else None
         success, result_message = _telegram_tv_login(
-            code, database_user_id, chat_id, progress_id, request.remote_addr
+            code,
+            database_user_id,
+            chat_id,
+            progress_id,
+            request.remote_addr,
+            pool_type=tv_pool_type
         )
         final_text = ('Success\n\n' if success else 'TV login failed\n\n') + result_message
         if not _telegram_edit(chat_id, progress_id, final_text):
             _telegram_send(chat_id, final_text)
         if update_id is not None:
             _telegram_finish_update(
-                update_id, 'completed', summary={'operation': 'tv', 'success': success}
+                update_id,
+                'completed',
+                summary={'operation': tv_command, 'success': success}
             )
         return jsonify({'ok': True})
     if text.startswith('/tv'):
-        _telegram_send(chat_id, 'Invalid TV code. Use exactly 8 digits, for example: /tv 12345678')
+        example_command = '/tvadmin' if text.startswith('/tvadmin') else '/tv'
+        _telegram_send(
+            chat_id,
+            f'Invalid TV code. Use exactly 8 digits, for example: {example_command} 12345678'
+        )
         return jsonify({'ok': True})
-    if re.fullmatch(r'/random(?:@\w+)?\s*', raw_text, re.I):
+    account_command_match = re.fullmatch(
+        r'/(ph|us|random)(?:@\w+)?\s*', raw_text, re.I
+    )
+    if account_command_match:
+        account_command = account_command_match.group(1).lower()
+        account_config = {
+            'ph': ('ph', 'PH ACCOUNT'),
+            'us': ('us', 'US ACCOUNT'),
+            'random': ('public', 'RANDOM ACCOUNT')
+        }
+        account_pool_type, result_title = account_config[account_command]
+        ledger_command = f'/{account_command}'
         database_user_id = os.environ.get('TELEGRAM_DATABASE_USER_ID', '').strip()
         if not re.fullmatch(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', database_user_id):
             _telegram_send(chat_id, 'Bot configuration error: TELEGRAM_DATABASE_USER_ID is missing or invalid.')
             return jsonify({'ok': True})
         if update_id is not None:
             claim_result = _telegram_claim_update(
-                update_id, telegram_user_id, chat_id, '/random'
+                update_id, telegram_user_id, chat_id, ledger_command
             )
             if claim_result is not True:
                 if claim_result is None:
@@ -2328,7 +2427,8 @@ def telegram_webhook():
                 return jsonify({'ok': True})
         progress = _telegram_send(
             chat_id,
-            'Finding a random working account.\nPriority: PH Premium -> US Premium -> other active subscriptions.'
+            f'Finding a random working account.\nPool: '
+            f'{_telegram_pool_label(account_pool_type)}.'
         )
         progress_id = progress.get('message_id') if isinstance(progress, dict) else None
         success, result_message, reply_markup, selected_account_id = _telegram_random_account(
@@ -2336,9 +2436,15 @@ def telegram_webhook():
             chat_id,
             progress_id,
             request.remote_addr,
-            request.url_root.rstrip('/')
+            request.url_root.rstrip('/'),
+            pool_type=account_pool_type,
+            command_name=ledger_command,
+            result_title=result_title
         )
-        final_text = result_message if success else '❌ RANDOM ACCOUNT FAILED\n\n' + result_message
+        final_text = (
+            result_message
+            if success else f'❌ {result_title} FAILED\n\n{result_message}'
+        )
         parse_mode = 'HTML' if success else None
         if not _telegram_edit(
             chat_id,
@@ -2354,7 +2460,10 @@ def telegram_webhook():
                 parse_mode=parse_mode
             )
         if update_id is not None:
-            random_summary = {'operation': 'random', 'success': success}
+            random_summary = {
+                'operation': account_command,
+                'success': success
+            }
             if selected_account_id:
                 random_summary['account_id'] = selected_account_id
             _telegram_finish_update(
@@ -3725,62 +3834,6 @@ def _get_random_tv_candidates(viewer_country):
 
     random.SystemRandom().shuffle(candidates)
     return candidates
-
-
-def _tv_candidate_priority(account):
-    """PH Premium first, US Premium second, then every other active plan."""
-    country = str(account.get('country') or '').strip().upper()
-    if country in ('PHILIPPINES', 'PILIPINAS'):
-        country = 'PH'
-    elif country in ('UNITED STATES', 'UNITED STATES OF AMERICA', 'USA'):
-        country = 'US'
-    plan_text = ' '.join((
-        str(account.get('plan') or ''),
-        str(account.get('subscription_type') or '')
-    )).lower()
-    is_premium_plan = 'premium' in plan_text
-    if country == 'PH' and is_premium_plan:
-        return 0, 'PH Premium'
-    if country == 'US' and is_premium_plan:
-        return 1, 'US Premium'
-    return 2, 'Other active subscription'
-
-
-def _prioritized_tv_candidates(
-    candidates, per_tier, prefer_recent=False, recent_account_ids=None
-):
-    """Randomize within each priority tier and guarantee fallback tiers get attempts."""
-    tiers = {0: [], 1: [], 2: []}
-    for account in candidates:
-        priority, _ = _tv_candidate_priority(account)
-        tiers[priority].append(account)
-
-    secure_random = random.SystemRandom()
-    recent_rank = {
-        str(account_id): rank
-        for rank, account_id in enumerate(recent_account_ids or [])
-        if account_id
-    }
-    selected = []
-    for priority in (0, 1, 2):
-        secure_random.shuffle(tiers[priority])
-        # Keep the tier priority intact, but rotate accounts within each tier.
-        # Never-served accounts come first. Previously served accounts are ordered
-        # from least-recent to most-recent, preventing immediate repeats whenever
-        # another candidate exists.
-        def candidate_order(account):
-            account_id = str(account.get('id') or '')
-            served_rank = recent_rank.get(account_id)
-            was_served = served_rank is not None
-            validation_rank = (
-                0 if _account_was_recently_validated(account) else 1
-            ) if prefer_recent else 0
-            rotation_rank = -served_rank if was_served else 0
-            return was_served, rotation_rank, validation_rank
-
-        tiers[priority].sort(key=candidate_order)
-        selected.extend(tiers[priority][:per_tier])
-    return selected
 
 
 def _record_tv_validation(account, is_valid, info):

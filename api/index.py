@@ -1551,22 +1551,32 @@ def _telegram_send(chat_id, text, reply_markup=None, parse_mode=None):
 def _telegram_edit(chat_id, message_id, text, reply_markup=None, parse_mode=None):
     if not message_id:
         return None
-    try:
-        message_text = str(text or '')
-        payload = {
-            'chat_id': chat_id,
-            'message_id': message_id,
-            'text': message_text if parse_mode else message_text[:3500]
-        }
-        if parse_mode:
-            payload['parse_mode'] = parse_mode
-            payload['link_preview_options'] = {'is_disabled': True}
-        if reply_markup:
-            payload['reply_markup'] = reply_markup
-        return _telegram_api('editMessageText', payload)
-    except Exception as exc:
-        logger.warning(f'Telegram progress update failed: {exc}')
-        return None
+    message_text = str(text or '')
+    payload = {
+        'chat_id': chat_id,
+        'message_id': message_id,
+        'text': message_text if parse_mode else message_text[:3500]
+    }
+    if parse_mode:
+        payload['parse_mode'] = parse_mode
+        payload['link_preview_options'] = {'is_disabled': True}
+    if reply_markup:
+        payload['reply_markup'] = reply_markup
+
+    last_error = None
+    for attempt in range(3):
+        try:
+            return _telegram_api('editMessageText', payload, timeout=12)
+        except Exception as exc:
+            last_error = exc
+            error_text = str(exc).lower()
+            # A previous timed-out edit may still have reached Telegram.
+            if 'message is not modified' in error_text:
+                return {'message_id': message_id}
+            if not isinstance(exc, requests.RequestException) or attempt == 2:
+                break
+    logger.warning(f'Telegram progress update failed: {last_error}')
+    return None
 
 
 def _telegram_download_document(document):
@@ -1577,17 +1587,39 @@ def _telegram_download_document(document):
     if claimed_size and claimed_size > max_bytes:
         raise ValueError(f'File is larger than the configured {max_bytes // (1024 * 1024)} MB limit')
 
-    file_info = _telegram_api('getFile', {'file_id': document.get('file_id')})
+    file_info = None
+    last_error = None
+    for attempt in range(3):
+        try:
+            file_info = _telegram_api(
+                'getFile', {'file_id': document.get('file_id')}, timeout=30
+            )
+            break
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt == 2:
+                raise
+    if file_info is None and last_error:
+        raise last_error
     file_path = (file_info or {}).get('file_path')
     if not file_path:
         raise RuntimeError('Telegram did not return a downloadable file path')
 
     token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
-    response = requests.get(
-        f'https://api.telegram.org/file/bot{token}/{file_path}',
-        timeout=60
-    )
-    response.raise_for_status()
+    response = None
+    for attempt in range(3):
+        try:
+            response = requests.get(
+                f'https://api.telegram.org/file/bot{token}/{file_path}',
+                timeout=60
+            )
+            response.raise_for_status()
+            break
+        except requests.RequestException:
+            if attempt == 2:
+                raise
+    if response is None:
+        raise RuntimeError('Telegram file download failed')
     if len(response.content) > max_bytes:
         raise ValueError(f'File is larger than the configured {max_bytes // (1024 * 1024)} MB limit')
     return response.content
@@ -1638,7 +1670,7 @@ def _telegram_cookie_files(payload, filename):
 
 
 def _telegram_claim_update(update_id, telegram_user_id, chat_id, filename):
-    """Deduplicate Telegram retries. If migration is absent, continue with an error log."""
+    """Deduplicate Telegram retries; fail closed when the job ledger is unavailable."""
     headers = supabase_service_headers(
         'resolution=ignore-duplicates,return=representation'
     )
@@ -1656,12 +1688,12 @@ def _telegram_claim_update(update_id, telegram_user_id, chat_id, filename):
             },
             timeout=15
         )
-        if response.status_code == 201:
+        if response.status_code in (200, 201):
             return bool(response.json())
-        logger.error(f'Telegram job claim failed ({response.status_code}); processing without dedupe')
+        logger.error(f'Telegram job claim failed ({response.status_code}); refusing unsafe duplicate processing')
     except Exception as exc:
-        logger.error(f'Telegram job claim error; processing without dedupe: {exc}')
-    return True
+        logger.error(f'Telegram job claim error; refusing unsafe duplicate processing: {exc}')
+    return None
 
 
 def _telegram_finish_update(update_id, status, summary=None, error=None):
@@ -1778,19 +1810,6 @@ def _telegram_results_message(filename, results):
         f'└ ♻️ Duplicates skipped: {len(duplicates)}'
     ]
 
-    if valid:
-        lines.append('\n✅ VALID ACCOUNTS')
-        for item in valid[:10]:
-            email = str(item.get('email') or 'Unknown').replace('\n', ' ')[:100]
-            country = str(item.get('country') or 'Unknown')[:20]
-            plan = str(item.get('plan') or 'Unknown').replace('\n', ' ')[:80]
-            saved_label = '💾' if item.get('stored_in_db') else '⚠️'
-            lines.append(f'{saved_label} {email}\n   {country} • {plan}')
-        if len(valid) > 10:
-            lines.append(f'\n…and {len(valid) - 10} more valid account(s)')
-
-    if invalid:
-        lines.append('\nℹ️ Invalid account details are hidden to keep this report clean.')
     return '\n'.join(lines), {
         'total': len(results),
         'valid': len(valid),
@@ -2124,10 +2143,14 @@ def telegram_webhook():
         if not re.fullmatch(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', database_user_id):
             _telegram_send(chat_id, 'Bot configuration error: TELEGRAM_DATABASE_USER_ID is missing or invalid.')
             return jsonify({'ok': True})
-        if update_id is not None and not _telegram_claim_update(
-            update_id, telegram_user_id, chat_id, '/tv'
-        ):
-            return jsonify({'ok': True})
+        if update_id is not None:
+            claim_result = _telegram_claim_update(
+                update_id, telegram_user_id, chat_id, '/tv'
+            )
+            if claim_result is not True:
+                if claim_result is None:
+                    _telegram_send(chat_id, 'Unable to start safely because the job ledger is unavailable. Please try again shortly.')
+                return jsonify({'ok': True})
         progress = _telegram_send(
             chat_id,
             'TV login started.\nPriority: PH Premium -> US Premium -> other active subscriptions.'
@@ -2152,10 +2175,14 @@ def telegram_webhook():
         if not re.fullmatch(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', database_user_id):
             _telegram_send(chat_id, 'Bot configuration error: TELEGRAM_DATABASE_USER_ID is missing or invalid.')
             return jsonify({'ok': True})
-        if update_id is not None and not _telegram_claim_update(
-            update_id, telegram_user_id, chat_id, '/random'
-        ):
-            return jsonify({'ok': True})
+        if update_id is not None:
+            claim_result = _telegram_claim_update(
+                update_id, telegram_user_id, chat_id, '/random'
+            )
+            if claim_result is not True:
+                if claim_result is None:
+                    _telegram_send(chat_id, 'Unable to start safely because the job ledger is unavailable. Please try again shortly.')
+                return jsonify({'ok': True})
         progress = _telegram_send(
             chat_id,
             'Finding a random working account.\nPriority: PH Premium -> US Premium -> other active subscriptions.'
@@ -2208,10 +2235,18 @@ def telegram_webhook():
         return jsonify({'ok': True})
 
     filename = os.path.basename(document.get('file_name') or 'upload.zip')
-    if update_id is not None and not _telegram_claim_update(
-        update_id, telegram_user_id, chat_id, filename
-    ):
-        return jsonify({'ok': True})
+    if update_id is not None:
+        claim_result = _telegram_claim_update(
+            update_id, telegram_user_id, chat_id, filename
+        )
+        if claim_result is not True:
+            if claim_result is None:
+                _telegram_send(
+                    chat_id,
+                    'Unable to start this batch safely because the job ledger is unavailable. '
+                    'Please verify the Telegram migration and try again shortly.'
+                )
+            return jsonify({'ok': True})
 
     progress_message = _telegram_send(
         chat_id,
@@ -2220,11 +2255,14 @@ def telegram_webhook():
     progress_message_id = (
         progress_message.get('message_id') if isinstance(progress_message, dict) else None
     )
-    last_progress_edit = {'time': 0.0}
+    last_progress_edit = {'time': time.monotonic(), 'completed': 0}
 
     def report_progress(completed, total, current_results):
+        if completed >= total:
+            return
         now = time.monotonic()
-        if completed < total and now - last_progress_edit['time'] < 1.5:
+        completed_delta = completed - last_progress_edit['completed']
+        if completed_delta < 25 and now - last_progress_edit['time'] < 10:
             return
         _telegram_edit(
             chat_id,
@@ -2232,6 +2270,7 @@ def telegram_webhook():
             _telegram_progress_message(filename, completed, total, current_results)
         )
         last_progress_edit['time'] = now
+        last_progress_edit['completed'] = completed
 
     try:
         payload = _telegram_download_document(document)
@@ -2239,14 +2278,8 @@ def telegram_webhook():
             payload, filename, database_user_id, progress_callback=report_progress
         )
         result_text, summary = _telegram_results_message(filename, results)
-        _telegram_edit(
-            chat_id,
-            progress_message_id,
-            f'Checking complete: {filename}\n'
-            f'{summary["total"]} checked | {summary["valid"]} valid | '
-            f'{summary["saved"]} saved | {summary["invalid"]} invalid'
-        )
-        _telegram_send(chat_id, result_text)
+        if not _telegram_edit(chat_id, progress_message_id, result_text):
+            _telegram_send(chat_id, result_text)
         if update_id is not None:
             _telegram_finish_update(update_id, 'completed', summary=summary)
     except Exception as exc:

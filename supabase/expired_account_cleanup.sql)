@@ -1,0 +1,80 @@
+-- Confirmed expired/dead Netflix account retention cleanup.
+-- Safe to rerun. Scheduled deletion waits 7 days after deactivation.
+
+create extension if not exists pg_cron;
+
+create or replace function public.cleanup_expired_netflix_accounts(
+  retention_days integer default 7,
+  batch_limit integer default 500
+)
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  doomed_ids uuid[];
+  deleted_count integer := 0;
+begin
+  retention_days := greatest(0, least(coalesce(retention_days, 7), 365));
+  batch_limit := greatest(1, least(coalesce(batch_limit, 500), 5000));
+
+  select array_agg(candidate.id)
+  into doomed_ids
+  from (
+    select id
+    from public.netflix_accounts
+    where is_active is false
+      and (
+        is_expired is true
+        or validation_status in ('expired', 'dead')
+      )
+      and coalesce(deactivated_at, last_checked, created_at, now())
+          <= now() - make_interval(days => retention_days)
+    order by coalesce(deactivated_at, last_checked, created_at) asc nulls first
+    limit batch_limit
+  ) as candidate;
+
+  if doomed_ids is null or cardinality(doomed_ids) = 0 then
+    return 0;
+  end if;
+
+  -- Remove logs that may reference the account before deleting the account.
+  if to_regclass('public.token_logs') is not null then
+    execute 'delete from public.token_logs where account_id = any($1)'
+      using doomed_ids;
+  end if;
+
+  delete from public.netflix_accounts
+  where id = any(doomed_ids);
+  get diagnostics deleted_count = row_count;
+  return deleted_count;
+end;
+$$;
+
+revoke all on function public.cleanup_expired_netflix_accounts(integer, integer)
+  from public, anon, authenticated;
+grant execute on function public.cleanup_expired_netflix_accounts(integer, integer)
+  to service_role;
+
+do $$
+begin
+  perform cron.unschedule('purge-expired-netflix-accounts');
+exception when others then null;
+end
+$$;
+
+select cron.schedule(
+  'purge-expired-netflix-accounts',
+  '30 3 * * *',
+  $job$
+    select public.cleanup_expired_netflix_accounts(7, 500);
+  $job$
+);
+
+-- Optional one-time immediate cleanup after reviewing the target rows:
+-- select id, email, validation_status, is_expired, deactivated_at
+-- from public.netflix_accounts
+-- where is_active is false
+--   and (is_expired is true or validation_status in ('expired', 'dead'));
+-- select public.cleanup_expired_netflix_accounts(0, 5000);

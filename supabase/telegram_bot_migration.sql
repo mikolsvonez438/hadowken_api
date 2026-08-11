@@ -19,6 +19,12 @@ create index if not exists telegram_bot_jobs_created_at_idx
 
 alter table public.telegram_bot_jobs enable row level security;
 
+-- The webhook must atomically claim update IDs through the backend-only key.
+-- Without this grant, Telegram retries could start the same large ZIP again.
+grant select, insert, update, delete
+    on table public.telegram_bot_jobs
+    to service_role;
+
 -- Expiring indirection for Telegram copy buttons. Netflix login URLs can be
 -- longer than Telegram's 256-character CopyTextButton limit, so the bot stores
 -- the token here and gives Telegram a short, unguessable redirect URL.

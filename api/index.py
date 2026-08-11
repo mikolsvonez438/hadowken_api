@@ -255,6 +255,24 @@ def parse_next_billing_date(date_str):
     return parsed_date.date().isoformat(), days_left
 
 
+def resolve_billing_state(next_billing_date, stored_days=None):
+    """Return normalized renewal, current calendar days, and billing state."""
+    normalized_date, calculated_days = parse_next_billing_date(next_billing_date)
+    days_left = calculated_days
+    if days_left is None and stored_days is not None:
+        try:
+            days_left = int(stored_days)
+        except (TypeError, ValueError):
+            days_left = None
+    if days_left is None:
+        status = 'unknown'
+    elif days_left <= 0:
+        status = 'expired'
+    else:
+        status = 'active'
+    return normalized_date or next_billing_date, days_left, status
+
+
 def is_super_admin(user_id):
     if not user_id:
         return False
@@ -597,7 +615,7 @@ def check_netflix_cookie(cookie_dict):
 
         # Check 4: Billing expired
         is_expired = False
-        if days_left is not None and days_left < 0:
+        if days_left is not None and days_left <= 0:
             is_expired = True
 
         # Check 5: Membership status
@@ -844,7 +862,7 @@ def store_netflix_account(email, netflix_id, secure_netflix_id, subscription_typ
         clean_email = decode_unicode(email)
 
         # Skip clearly expired accounts
-        if is_expired and days_until_billing is not None and days_until_billing < 0:
+        if is_expired and days_until_billing is not None and days_until_billing <= 0:
             logger.warning(f"Skipping expired account: {clean_email} ({days_until_billing} days)")
             return False, None
 
@@ -1250,7 +1268,9 @@ def check_cookie(user):
                 }
             })
         
-        token_result = generate_token(netflix_id)
+        token_result = generate_token(
+            netflix_id, account.data.get('secure_netflix_id')
+        )
         
         if token_result["status"] != "Success":
             return jsonify({
@@ -2410,10 +2430,25 @@ def get_accounts(user):
         
         safe_accounts = []
         viewer_country = get_viewer_country()
+        service_headers = supabase_service_headers('return=minimal')
         for acc in accounts.data or []:
-            # Extra safety: skip anything that slipped through with negative billing
-            days_left = acc.get('days_until_billing')
-            if days_left is not None and days_left < 0:
+            renewal_date, days_left, billing_status = resolve_billing_state(
+                acc.get('next_billing_date'), acc.get('days_until_billing')
+            )
+            # Enforce billing state dynamically. Stored days_until_billing can
+            # become stale between daily cron runs, so calculate from the date.
+            if billing_status == 'expired':
+                _deactivate_account(
+                    acc['id'],
+                    f'Renewal date has passed: {renewal_date}',
+                    service_headers,
+                    extra_data={
+                        'validation_status': 'expired',
+                        'last_validation_error': f'Renewal date has passed: {renewal_date}',
+                        'days_until_billing': days_left,
+                        'next_billing_date': renewal_date
+                    }
+                )
                 continue
             
             is_ad_plan, region_compatible = get_region_compatibility(
@@ -2430,7 +2465,9 @@ def get_accounts(user):
                 # The UI only needs availability, never the credential itself.
                 'secure_netflix_id': bool(acc.get('secure_netflix_id')),
                 'days_until_billing': days_left,
-                'next_billing_date': acc.get('next_billing_date'),
+                'next_billing_date': renewal_date,
+                'billing_status': billing_status,
+                'account_status': 'active',
                 'is_ad_supported_plan': is_ad_plan,
                 'region_compatible': region_compatible,
                 'viewer_country': viewer_country
@@ -2470,12 +2507,14 @@ def get_exclusive_accounts(user):
     try:
         fields = (
             'id,email,subscription_type,country,plan,exclusive_access,'
-            'reserved_for_super_admin,is_active,created_at,last_checked'
+            'reserved_for_super_admin,is_active,created_at,last_checked,'
+            'next_billing_date,days_until_billing,is_expired'
         )
         query = urllib.parse.urlencode({
             'select': fields,
             'or': '(exclusive_access.eq.true,reserved_for_super_admin.eq.true)',
             'is_active': 'eq.true',
+            'is_expired': 'eq.false',
             'order': 'created_at.desc',
             'limit': '1000'
         })
@@ -2490,7 +2529,31 @@ def get_exclusive_accounts(user):
                 f"{response.text[:200]}"
             )
 
-        account_rows = response.json()
+        account_rows = []
+        service_headers = supabase_service_headers('return=minimal')
+        for account in response.json():
+            renewal_date, days_left, billing_status = resolve_billing_state(
+                account.get('next_billing_date'), account.get('days_until_billing')
+            )
+            if billing_status == 'expired':
+                reason = f'Renewal date has passed: {renewal_date}'
+                _deactivate_account(
+                    account['id'],
+                    reason,
+                    service_headers,
+                    extra_data={
+                        'validation_status': 'expired',
+                        'last_validation_error': reason,
+                        'days_until_billing': days_left,
+                        'next_billing_date': renewal_date
+                    }
+                )
+                continue
+            account['next_billing_date'] = renewal_date
+            account['days_until_billing'] = days_left
+            account['billing_status'] = billing_status
+            account['account_status'] = 'active'
+            account_rows.append(account)
         
         ph_accounts = [a for a in account_rows if a.get('country') == 'PH']
         other_accounts = [a for a in account_rows if a.get('country') != 'PH']
@@ -2578,6 +2641,29 @@ def generate_account_token(user, account_id):
                 "status": "error",
                 "message": "Account not found"
             }), 404
+
+        renewal_date, days_left, billing_status = resolve_billing_state(
+            account.data.get('next_billing_date'),
+            account.data.get('days_until_billing')
+        )
+        if billing_status == 'expired':
+            reason = f'Renewal date has passed: {renewal_date}'
+            _deactivate_account(
+                account_id,
+                reason,
+                supabase_service_headers('return=minimal'),
+                extra_data={
+                    'validation_status': 'expired',
+                    'last_validation_error': reason,
+                    'days_until_billing': days_left,
+                    'next_billing_date': renewal_date
+                }
+            )
+            return jsonify({
+                'status': 'error',
+                'code': 'BILLING_OVERDUE',
+                'message': f'Account expired because its renewal date was {renewal_date}.'
+            }), 410
 
         viewer_country = get_viewer_country()
         is_ad_plan, region_compatible = get_region_compatibility(
@@ -2894,18 +2980,25 @@ def bulk_recheck_accounts(user):
                 continue
 
             try:
-                account_info = check_netflix_cookie({"NetflixId": netflix_id})
+                cookie_dict = {'NetflixId': netflix_id}
+                if account.get('secure_netflix_id'):
+                    cookie_dict['SecureNetflixId'] = account['secure_netflix_id']
+                account_info = check_netflix_cookie(cookie_dict)
             except Exception as e:
                 logger.error(f"Exception checking {email}: {e}")
-                # CRITICAL: Mark as invalid on ANY exception
-                _deactivate_account(account_id, f'Check exception: {str(e)[:100]}', headers)
-                invalid_count += 1
-                results.append({'email': email, 'status': 'invalid', 'reason': f'Check failed: {str(e)[:100]}'})
+                # A temporary checker failure must not destroy a usable record.
+                results.append({
+                    'email': email,
+                    'status': 'error',
+                    'reason': f'Temporary check failure: {str(e)[:100]}'
+                })
                 continue
             
             # Determine validity
             is_valid = account_info.get('ok', False)
             error_reason = account_info.get('err', 'Unknown error')
+            health_status, classified_reason = classify_account_health(account_info)
+            error_reason = classified_reason or error_reason
             
             # Additional safety checks
             if is_valid and (not account_info.get('email') or account_info.get('email') == 'Unknown'):
@@ -2928,6 +3021,8 @@ def bulk_recheck_accounts(user):
                     'next_billing_date': account_info.get('next_billing_date'),
                     'days_until_billing': account_info.get('days_until_billing'),
                     'is_expired': False,
+                    'validation_status': 'working',
+                    'last_validation_error': None,
                     'deactivated_reason': None,
                     'deactivated_at': None
                 }
@@ -2947,7 +3042,16 @@ def bulk_recheck_accounts(user):
                 })
                 
             else:
-                # Mark as invalid
+                if health_status == 'unknown':
+                    results.append({
+                        'email': email,
+                        'status': 'error',
+                        'reason': error_reason
+                    })
+                    continue
+
+                # Confirmed expired/dead records become inactive. The scheduled
+                # retention cleanup removes them later.
                 success = _deactivate_account(
                     account_id, 
                     error_reason, 
@@ -2999,13 +3103,25 @@ def bulk_recheck_accounts(user):
 
 def _deactivate_account(account_id, reason, headers, extra_data=None):
     """Helper to mark account as inactive with proper error handling"""
+    health_status, _ = classify_account_health({
+        'ok': False,
+        'err': reason,
+        'is_expired': any(
+            term in str(reason or '').lower()
+            for term in ('renewal', 'payment', 'billing', 'cancel', 'on hold', 'inactive')
+        )
+    })
+    if health_status == 'unknown':
+        health_status = 'dead'
     update_data = {
         'is_active': False,
         'last_checked': datetime.now(timezone.utc).isoformat(),
         'deactivated_reason': reason,
         'deactivated_at': datetime.now(timezone.utc).isoformat(),
-        'is_expired': True,
-        'is_premium': False
+        'is_expired': health_status == 'expired',
+        'is_premium': False,
+        'validation_status': health_status,
+        'last_validation_error': reason
     }
     if extra_data:
         update_data.update(extra_data)
@@ -3435,7 +3551,7 @@ def validate_netflix_cookie_quick(cookie_dict):
         next_billing_date, days_until_billing = parse_next_billing_date(
             next_billing_raw
         )
-        if days_until_billing is not None and days_until_billing < 0:
+        if days_until_billing is not None and days_until_billing <= 0:
             return False, {
                 'err': f'Renewal date has passed: {next_billing_date}',
                 'is_expired': True,
@@ -3527,8 +3643,24 @@ def _get_random_tv_candidates(viewer_country):
     for account in response.json():
         if not account.get('netflix_id') or not account.get('secure_netflix_id'):
             continue
-        days_left = account.get('days_until_billing')
-        if days_left is not None and days_left < 0:
+        renewal_date, days_left, billing_status = resolve_billing_state(
+            account.get('next_billing_date'), account.get('days_until_billing')
+        )
+        account['next_billing_date'] = renewal_date
+        account['days_until_billing'] = days_left
+        if billing_status == 'expired':
+            reason = f'Renewal date has passed: {renewal_date}'
+            _deactivate_account(
+                account.get('id'),
+                reason,
+                _tv_service_headers(),
+                extra_data={
+                    'validation_status': 'expired',
+                    'last_validation_error': reason,
+                    'days_until_billing': days_left,
+                    'next_billing_date': renewal_date
+                }
+            )
             continue
         _, region_compatible = get_region_compatibility(
             account.get('plan'), account.get('subscription_type'), viewer_country

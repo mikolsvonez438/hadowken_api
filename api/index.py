@@ -718,7 +718,7 @@ def check_netflix_cookie(cookie_dict):
         logger.error(f"Error checking cookie: {str(e)}")
         return {'ok': False, 'err': str(e)}
 
-def generate_token(netflix_id):
+def generate_token(netflix_id, secure_netflix_id=None):
     url = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
     
     params = {
@@ -741,6 +741,10 @@ def generate_token(netflix_id):
         'progressive': "false",
         'responseFormat': "json"
     }
+
+    cookie_header = f"NetflixId={netflix_id}"
+    if secure_netflix_id:
+        cookie_header += f"; SecureNetflixId={secure_netflix_id}"
 
     headers = {
         'User-Agent': "Argo/15.48.1 (iPhone; iOS 15.8.5; Scale/2.00)",
@@ -770,7 +774,7 @@ def generate_token(netflix_id):
         'x-netflix.context.pixel-density': "2.0",
         'x-netflix.request.toplevel.uuid': "90AFE39F-ADF1-4D8A-B33E-528730990FE3",
         'x-netflix.request.client.timezoneid': "Asia/Dhaka",
-        'Cookie': f"NetflixId={netflix_id}"
+        'Cookie': cookie_header
     }
 
     try:
@@ -1819,10 +1823,34 @@ def _telegram_results_message(filename, results):
     }
 
 
-def _telegram_priority_pool():
-    per_tier = _telegram_env_int('TELEGRAM_ACCOUNT_ATTEMPTS_PER_TIER', 6, 1, 15)
+def _account_was_recently_validated(account, freshness_minutes=None):
+    """Use a recent successful database check without immediately hitting Netflix again."""
+    if freshness_minutes is None:
+        freshness_minutes = _telegram_env_int(
+            'TELEGRAM_VALIDATION_FRESH_MINUTES', 60, 1, 1440
+        )
+    raw_checked = str(account.get('last_checked') or '').strip()
+    if not raw_checked:
+        return False
+    try:
+        checked_at = datetime.fromisoformat(raw_checked.replace('Z', '+00:00'))
+        if checked_at.tzinfo is None:
+            checked_at = checked_at.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return False
+    age = datetime.now(timezone.utc) - checked_at.astimezone(timezone.utc)
+    return timedelta(0) <= age <= timedelta(minutes=freshness_minutes)
+
+
+def _telegram_priority_pool(per_tier=None, prefer_recent=False):
+    if per_tier is None:
+        per_tier = _telegram_env_int(
+            'TELEGRAM_ACCOUNT_ATTEMPTS_PER_TIER', 6, 1, 15
+        )
     candidates = _get_random_tv_candidates(None)
-    return _prioritized_tv_candidates(candidates, per_tier)
+    return _prioritized_tv_candidates(
+        candidates, per_tier, prefer_recent=prefer_recent
+    )
 
 
 def _telegram_tv_login(code, database_user_id, chat_id, message_id, ip_address):
@@ -2031,31 +2059,57 @@ def telegram_short_login_redirect(code, device):
 
 def _telegram_random_account(database_user_id, chat_id, message_id, ip_address, base_url):
     try:
-        candidates = _telegram_priority_pool()
+        attempts_per_tier = _telegram_env_int(
+            'TELEGRAM_RANDOM_ATTEMPTS_PER_TIER', 25, 1, 100
+        )
+        candidates = _telegram_priority_pool(
+            per_tier=attempts_per_tier, prefer_recent=True
+        )
     except Exception as exc:
         logger.exception('Telegram random-account loading failed')
         return False, f'Unable to load the account pool: {exc}', None
     if not candidates:
         return False, 'No active accounts with both NetflixId cookies are available.', None
 
-    for attempt, account in enumerate(candidates, 1):
-        _, tier_label = _tv_candidate_priority(account)
-        _telegram_edit(
-            chat_id,
-            message_id,
-            f'Random account: checking {attempt}/{len(candidates)}\n'
-            f'Priority group: {tier_label}\n'
-            'Validating the membership before generating login links...'
-        )
-        is_valid, info = validate_netflix_cookie_quick({
-            'NetflixId': account['netflix_id'],
-            'SecureNetflixId': account['secure_netflix_id']
-        })
-        _record_tv_validation(account, is_valid, info)
-        if not is_valid:
-            continue
+    timeout_seconds = _telegram_env_int(
+        'TELEGRAM_RANDOM_TIMEOUT_SECONDS', 90, 30, 240
+    )
+    started_at = time.monotonic()
+    attempts = 0
+    timed_out = False
 
-        token_result = generate_token(account['netflix_id'])
+    for attempt, account in enumerate(candidates, 1):
+        if attempts and time.monotonic() - started_at >= timeout_seconds:
+            timed_out = True
+            break
+        attempts = attempt
+        _, tier_label = _tv_candidate_priority(account)
+        recently_validated = _account_was_recently_validated(account)
+        if attempt == 1 or attempt % 5 == 0:
+            validation_note = (
+                'Using its recent successful batch validation...'
+                if recently_validated else
+                'Validating the membership before generating login links...'
+            )
+            _telegram_edit(
+                chat_id,
+                message_id,
+                f'Random account: checking {attempt}/{len(candidates)}\n'
+                f'Priority group: {tier_label}\n'
+                f'{validation_note}'
+            )
+        if not recently_validated:
+            is_valid, info = validate_netflix_cookie_quick({
+                'NetflixId': account['netflix_id'],
+                'SecureNetflixId': account['secure_netflix_id']
+            })
+            _record_tv_validation(account, is_valid, info)
+            if not is_valid:
+                continue
+
+        token_result = generate_token(
+            account['netflix_id'], account.get('secure_netflix_id')
+        )
         if token_result.get('status') != 'Success':
             continue
         summary = _tv_account_summary(account)
@@ -2087,7 +2141,12 @@ def _telegram_random_account(database_user_id, chat_id, message_id, ip_address, 
             f'<a href="{html.escape(pc_url, quote=True)}">💻 Open PC Login</a>\n\n'
             '<i>Tap a link to open it.</i>'
         ), None
-    return False, f'No working account was found after {len(candidates)} prioritized attempt(s).', None
+    if timed_out:
+        return False, (
+            f'No working account was found before the {timeout_seconds}-second safety limit '
+            f'after {attempts} prioritized attempt(s).'
+        ), None
+    return False, f'No working account was found after {attempts} prioritized attempt(s).', None
 
 
 @app.route('/api/telegram/webhook', methods=['POST'])
@@ -3308,6 +3367,22 @@ def validate_netflix_cookie_quick(cookie_dict):
         resp = session.get('https://www.netflix.com/YourAccount', headers=headers, timeout=15)
         txt = resp.text
         txt_lower = txt.lower()
+
+        if resp.status_code == 429:
+            return False, {
+                'err': 'Temporary Netflix rate limit; keep the account active and retry later',
+                'needs_recheck': True
+            }
+        if resp.status_code == 403:
+            return False, {
+                'err': 'Temporary Netflix access block; keep the account active and retry later',
+                'needs_recheck': True
+            }
+        if resp.status_code >= 500:
+            return False, {
+                'err': f'Temporary Netflix server error (HTTP {resp.status_code})',
+                'needs_recheck': True
+            }
         
         # Check for login redirect
         if '"mode":"login"' in txt_lower or 'signin' in resp.url.lower():
@@ -3397,7 +3472,7 @@ def _get_random_tv_candidates(viewer_country):
     params = {
         'select': (
             'id,email,country,plan,subscription_type,netflix_id,secure_netflix_id,'
-            'days_until_billing'
+            'days_until_billing,last_checked'
         ),
         'is_active': 'eq.true',
         'is_premium': 'eq.true',
@@ -3452,7 +3527,7 @@ def _tv_candidate_priority(account):
     return 2, 'Other active subscription'
 
 
-def _prioritized_tv_candidates(candidates, per_tier):
+def _prioritized_tv_candidates(candidates, per_tier, prefer_recent=False):
     """Randomize within each priority tier and guarantee fallback tiers get attempts."""
     tiers = {0: [], 1: [], 2: []}
     for account in candidates:
@@ -3463,6 +3538,11 @@ def _prioritized_tv_candidates(candidates, per_tier):
     selected = []
     for priority in (0, 1, 2):
         secure_random.shuffle(tiers[priority])
+        if prefer_recent:
+            # Stable sorting preserves random order inside fresh/stale groups.
+            tiers[priority].sort(
+                key=lambda account: not _account_was_recently_validated(account)
+            )
         selected.extend(tiers[priority][:per_tier])
     return selected
 

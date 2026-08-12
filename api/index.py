@@ -273,6 +273,66 @@ def resolve_billing_state(next_billing_date, stored_days=None):
     return normalized_date or next_billing_date, days_left, status
 
 
+def detect_netflix_payment_source(page_text):
+    """Classify an explicit billing source or an explicit absence of one."""
+    if not page_text:
+        return 'unknown'
+    normalized = html.unescape(str(page_text)).lower()
+    normalized = re.sub(r'\s+', ' ', normalized)
+
+    provider_signals = (
+        'billed through',
+        'included with your package',
+        'included in your package',
+        'partner package',
+        'third-party billing',
+        'third party billing'
+    )
+    if any(signal in normalized for signal in provider_signals):
+        return 'provider'
+    if re.search(
+        r'["\'](?:isThirdPartyBilling|isPartnerBilling)["\']\s*:\s*true',
+        page_text,
+        re.I
+    ):
+        return 'provider'
+    if re.search(
+        r'["\'](?:billingPartner|partnerName)["\']\s*:\s*["\'][^"\']+["\']',
+        page_text,
+        re.I
+    ):
+        return 'provider'
+
+    # Only classify missing when Netflix says so explicitly. An absent or renamed
+    # HTML/JSON field is unknown, not proof that the account has no way to pay.
+    missing_signals = (
+        'no payment method on file',
+        'no payment method has been added',
+        'add a payment method to continue',
+        'add payment information to continue'
+    )
+    if any(signal in normalized for signal in missing_signals):
+        return 'missing'
+
+    if 'paypal' in normalized:
+        return 'paypal'
+    if 'gift card' in normalized or 'gift balance' in normalized:
+        return 'gift'
+    card_signals = (
+        'visa', 'mastercard', 'master card', 'american express',
+        'amex', 'discover', 'credit card', 'debit card'
+    )
+    if any(signal in normalized for signal in card_signals):
+        return 'card'
+    if re.search(
+        r'["\'](?:paymentMethod|paymentChoice|mopType)["\']\s*:\s*["\'][^"\']+["\']',
+        page_text,
+        re.I
+    ):
+        return 'payment_method'
+    return 'unknown'
+
+
 def is_super_admin(user_id):
     if not user_id:
         return False
@@ -562,6 +622,14 @@ def check_netflix_cookie(cookie_dict):
         resp = session.get(url, headers=headers, timeout=30)
         txt = resp.text
         txt_lower = txt.lower()
+
+        payment_source = detect_netflix_payment_source(txt)
+        if payment_source == 'missing':
+            return {
+                'ok': False,
+                'err': 'No payment method on file',
+                'missing_payment_method': True
+            }
 
         # Check 1: Redirected to login page = invalid cookie
         if '"mode":"login"' in txt_lower:
@@ -2910,6 +2978,11 @@ def classify_account_health(account_info):
     transient_terms = ('timeout', 'timed out', 'connection', 'dns', 'ssl', 'temporary', 'rate limit')
     expired_terms = ('payment', 'billing', 'cancel', 'inactive', 'on hold', 'restart', 'membership expired')
 
+    if (
+        account_info.get('missing_payment_method')
+        or 'no payment method on file' in normalized
+    ):
+        return 'dead', reason
     if any(term in normalized for term in transient_terms):
         return 'unknown', reason
     if account_info.get('is_expired') or any(term in normalized for term in expired_terms):
@@ -3675,6 +3748,13 @@ def validate_netflix_cookie_quick(cookie_dict):
                 'err': f'Temporary Netflix server error (HTTP {resp.status_code})',
                 'needs_recheck': True
             }
+
+        payment_source = detect_netflix_payment_source(txt)
+        if payment_source == 'missing':
+            return False, {
+                'err': 'No payment method on file',
+                'missing_payment_method': True
+            }
         
         # Check for login redirect
         if '"mode":"login"' in txt_lower or 'signin' in resp.url.lower():
@@ -3914,6 +3994,10 @@ def _prepare_tv_candidate(account):
         return 'transient', f'Netflix TV login temporarily returned HTTP {response.status_code}', None
     if response.status_code != 200:
         return 'transient', f'Netflix TV login returned HTTP {response.status_code}', None
+
+    payment_source = detect_netflix_payment_source(response.text)
+    if payment_source == 'missing':
+        return 'invalid', 'No payment method on file', None
 
     membership_status = get_val(response.text, 'membershipStatus')
     if membership_status and membership_status != 'CURRENT_MEMBER':

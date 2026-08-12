@@ -38,6 +38,7 @@ urllib3.disable_warnings(InsecureRequestWarning)
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 
+# Vercel-compatible limiter (memory storage acceptable for serverless)
 limiter = Limiter(app=app, key_func=get_remote_address, default_limits=[])
 
 app.config['SESSION_TYPE'] = 'filesystem'
@@ -1336,7 +1337,7 @@ def check_cookie(user):
             })
         
         token_result = generate_token(
-            netflix_id, account.data.get('secure_netflix_id')
+            netflix_id, secure_netflix_id
         )
         
         if token_result["status"] != "Success":
@@ -1566,7 +1567,7 @@ def process_content(content, filename, mode, is_premium_user, user_id):
     }
     
     if mode == 'generate_token' and is_premium_user:
-        token_result = generate_token(netflix_id)
+        token_result = generate_token(netflix_id, secure_netflix_id)
         if token_result["status"] == "Success":
             result_data["token"] = token_result["token"]
             result_data["expires"] = token_result["expires"]
